@@ -1,0 +1,690 @@
+---
+title: "04 combinations"
+output: html_document
+date: "2024-11-11"
+---
+
+In this coding file, two analyses were conducted:
+
+# Analysis 1: Comparing forecasts with exogenous variables AGAINST forecasts without exogenous variables
+- In this analysis, only Naive, AR, GAMLSS, GLM-GAMSEL, GAM-XGBoost, and MLP are used to compare the 2 models. For AR, exogenous variables use the AR (Mixed) model, while it is AR (Pure) model for without exogenous variables.
+
+Given that the running of models have all been labelled as submodels_copd or submodels_asthma for each horizon, the following steps must be done:
+(1) Renaming of function to admission_rate_(disease)(horizon_num)_(exog/nonexog)_090325 must be done to distinguish between the horizons, and variables. For the exogenous model, the ensemble forecasts must be constructed AGAIN since a different number of models are used for this comparison
+(2) Combination of horizons to a single dataset (should have 3666 observations)
+(3) Construction of superensemble models based on the individual models
+(4) Addition of the Naive model
+
+This means that there will be a total of 2 models produced, one using exogenous variables, and another without exogenous variables.
+
+# Analysis 2: Comparing subgroup analyses effectiveness between AGGREGATED forecasts and TOTAL forecasts
+- In this analysis, it compares AGGREGATED forecasts (individually predicted subgroup rates, then aggregated) and TOTAL forecasts (directly forecasting the total forecasts)
+- AGGREGATED forecasts have already been constructed (since submodel rates have already been forecasted prior to this) and TOTAL forecasts have been done (forecasting of overall rates)
+- So what this analysis does is to perform the following steps
+(1) Usage of only AR, GAMLSS, GLM-GAMSEL, GAM-XGBoost, and MLP models
+(2) Code out process to construct aggregated forecast --> aggregated forecast = (individual forecasts * subgroup population) / (overall disease population)
+(3) Based on the models used, construct superensembles
+(4) Repeat for GENDER and AGE subgroups
+
+This means that there will be a total of 4 different models, which are...
+
+Model A1 - Age Total Forecast
+Model A2 - Age Aggregated Forecast
+Model B1 - Gender Total Forecast
+Model B2 - Gender Aggregated Forecast
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# library()
+rm(list=ls())
+library(tidyverse)
+
+copd_discharge_significant_predictors = c("female_asthma", "male_asthma", "cases_asthma", "MaxWind", "MeanWind", "MeanTemp", "MaxTemp", "MinTemp", "hot_week_indicator", "heat_wave_week", "Daily_Total_Rainfall","age_15_to_39_asthma", "age_40_to_54_asthma","age_55_to_64_asthma","age_65_to_74_asthma", "age_75_to_84_asthma")
+
+asthma_discharge_significant_predictors = c("female_copd", "male_copd", "age_55_to_64_copd", "age_65_to_74_copd", "age_75_to_84_copd","age_85_above_copd", "cases_copd", "MaxWind", "MeanWind", "MeanTemp", "MaxTemp", "MinTemp", "hot_week_indicator", "heat_wave_week", "Daily_Total_Rainfall")
+```
+
+## Analysis 1: Exogenous vs Non-Exogenous
+
+Part 1: Addition of Naive model
+Part 2: Renaming Variables
+Part 3: Combination into a single horizon
+Part 4: Generation of Superemsemble models
+
+```{r}
+data_editing_cases = function(df_filename, outcome, significant_predictors){
+  combined_df = read_csv(df_filename)%>%
+  column_to_rownames(var = "...1")
+  
+  if (outcome == "cases_copd"){
+    popn = "residents_copd"
+  } else if (outcome == "cases_asthma"){
+    popn = "residents_asthma"
+  } else {
+    actual_outcome = sub("_([^_]+)$", "", outcome)
+    last_part = sub(".*_(.*)$", "\\1", outcome)
+    popn = colnames(combined_df)[str_detect(colnames(combined_df), paste0(actual_outcome,"_residents","_",last_part))]
+  }
+  new_combined = combined_df %>% 
+    dplyr::select(year, week, outcome, popn, significant_predictors)
+  if (outcome == "male_asthma"|outcome=="male_copd"){
+    new_combined = new_combined %>% 
+      dplyr::select(-starts_with("female_residents"))
+  }
+  return(new_combined)
+}
+
+naive_model = function(df, horizon, outcome){
+  df[[outcome]] = dplyr::lag(df[[outcome]],n=horizon)
+  df = na.omit(df)
+  return(df)
+}
+
+addition_of_naive = function(df_link, outcome_var, disease, copd_lag_num = 1, asthma_lag = 1, env_lag = 1, horizon, training_limit=0.5, significant_predictors){
+  df = data_editing_cases(df_link, outcome_var, significant_predictors = significant_predictors)
+  env_variables_to_lag = c("MaxWind", "MeanWind", "MaxTemp", "MinTemp", "MeanTemp", "hot_week_indicator", "heat_wave_week", "Daily_Total_Rainfall")
+  other_disease_var = setdiff(significant_predictors, 
+                             c(outcome_var, env_variables_to_lag))
+  # return(df)
+  training_length = floor(nrow(df)*training_limit) # Number of observations used for training the data
+  if (str_detect(outcome_var,"copd")){
+    disease_popn = "residents_copd"
+    lagged_disease_popn = "residents_copd_L1"
+  } else if (str_detect(outcome_var,"asthma")){
+    disease_popn = "residents_asthma"
+    lagged_disease_popn = "residents_asthma_L1"
+  }
+  # Model 1: Naive Model
+  naive_x = naive_model(df,horizon,outcome = outcome_var)[[outcome_var]]
+  naive_y = df[(horizon+1):nrow(df),][[outcome_var]]
+  naive_x = naive_x[(training_length+1):length(naive_x)]
+  naive_y = naive_y[(training_length+1):length(naive_y)]
+  naive_pred = naive_x
+  naive_actual = naive_y
+  
+  # Generation of error dataframe
+  comparison_df = data.frame(
+    actual = naive_actual,
+    naive_predictions = naive_pred
+  )
+  return(comparison_df)
+}
+
+# x = addition_of_naive(df_link = "combined_asthma_env_080225_norates.csv", outcome_var = "female_overall_rate_asthma", disease = "asthma", horizon = 1, significant_predictors = asthma_discharge_significant_predictors)
+```
+
+CHUNK 1: FOR NON-EXOGENOUS VARIABLES
+```{r setup, include=FALSE}
+# Part 1: Renaming variables
+
+variables = c("noexog")
+
+renaming_fn = function(vec, disease){
+  if (disease == "copd"){
+    for (var in vec){
+      for (horizon in 1:12) {
+        file_name = paste0("admission_rate_", disease, horizon, "_", var, "_050325.rdata")
+        load(file_name)
+        combined_copd_df = submodels_copd
+        
+        # Addition of Naive model
+        comparison_df = addition_of_naive(df_link = "combined_asthma_env_080225_norates.csv", disease = disease, outcome_var = "overall_rate_copd",horizon=horizon,significant_predictors = copd_discharge_significant_predictors)
+        if (identical(combined_copd_df$actual, comparison_df$actual)) {
+            final_df = cbind(combined_copd_df, comparison_df%>% dplyr::select(-actual))
+        }
+        
+        combined_name_copd = paste0("admission_rate_", disease, horizon, "_", var, "_090325")
+        assign(combined_name_copd, final_df)
+        save_file_name = paste0(combined_name_copd, ".rdata")
+        save(list = combined_name_copd, file = save_file_name)
+      }
+    }
+  } else if (disease == "asthma"){
+    for (var in vec){
+      for (horizon in 1:12) {
+        file_name = paste0("admission_rate_", disease, horizon, "_", var, "_050325.rdata")
+        load(file_name)
+        combined_asthma_df = submodels_asthma
+        
+        # Addition of Naive model
+        comparison_df = addition_of_naive(df_link = "combined_asthma_env_080225_norates.csv", disease = disease, outcome_var = "overall_rate_asthma",horizon=horizon,significant_predictors = asthma_discharge_significant_predictors)
+        if (identical(combined_asthma_df$actual, comparison_df$actual)) {
+            final_df = cbind(combined_asthma_df, comparison_df%>% dplyr::select(-actual))
+        }
+        
+        combined_name_asthma = paste0("admission_rate_", disease, horizon, "_", var, "_090325")
+        assign(combined_name_asthma, final_df)
+        save_file_name = paste0(combined_name_asthma, ".rdata")
+        save(list = combined_name_asthma, file = save_file_name)
+      }
+    }
+  }
+  return("Done")
+}
+
+renaming_fn(variables, "copd")
+renaming_fn(variables, "asthma")
+
+# Part 2: Combination to a single dataframe
+rm(list=ls())
+file_name = paste0("admission_rate_asthma12_noexog_090325.rdata")
+load(file_name)
+no_exog_initial_col_names = colnames(admission_rate_asthma12_noexog_090325)
+no_exog_temp_df = get(paste0("admission_rate_asthma12_noexog_090325"))
+no_exog_temp_df$index = seq_len(nrow(no_exog_temp_df))
+no_exog_temp_df$horizon = 7
+no_exog_col_names = colnames(no_exog_temp_df)
+no_exog_len = length(no_exog_col_names)
+
+for (disease in c("copd","asthma")){
+  overall_df_combined = data.frame(matrix(ncol = no_exog_len, nrow = 0))
+  colnames(overall_df_combined) = no_exog_col_names
+  for (horizon in 1:12) {
+    file_name = paste0("admission_rate_", disease, horizon, "_noexog", "_090325.rdata")
+    load(file_name)
+    temp_df = get(paste0("admission_rate_", disease, horizon, "_noexog", "_090325"))
+    rownames(temp_df) = NULL
+    colnames(temp_df) = no_exog_initial_col_names
+    temp_df$index = seq_len(nrow(temp_df))
+    temp_df$horizon = horizon
+    overall_df_combined = rbind(overall_df_combined, temp_df)
+  }
+  overall_final_df = overall_df_combined %>%
+    rename("aml_predictions" = "aml_prediction") %>%
+    tidyr::fill(gam_lss_predictions, .direction = "down")
+  combined_name_var = paste0(disease, "_noexog", "_combined_090325")
+  assign(combined_name_var, overall_final_df)
+  save_file_name = paste0(combined_name_var, ".rdata")
+  save(list = combined_name_var, file = save_file_name)
+}
+
+```
+
+CHUNK 2: FOR EXOGENOUS VARIABLES
+- In this chunk, selection was made based on the models used for superensemble generation
+```{r}
+# Part 1: Renaming variables
+
+variables = c("exog")
+
+renaming_fn = function(vec, disease){
+  if (disease == "copd"){
+    for (var in vec){
+      for (horizon in 1:12) {
+        file_name = paste0("admission_rate_", disease, horizon, "_", var, "_050325.rdata")
+        load(file_name)
+        combined_copd_df = submodels_copd
+        
+        # Addition of Naive model
+        comparison_df = addition_of_naive(df_link = "combined_asthma_env_080225_norates.csv", disease = disease, outcome_var = "overall_rate_copd",horizon=horizon,significant_predictors = copd_discharge_significant_predictors)
+        if (identical(combined_copd_df$actual, comparison_df$actual)) {
+            final_df = cbind(combined_copd_df, comparison_df%>% dplyr::select(-actual))
+        }
+        
+        combined_name_copd = paste0("admission_rate_", disease, horizon, "_", var, "_090325")
+        assign(combined_name_copd, final_df)
+        save_file_name = paste0(combined_name_copd, ".rdata")
+        save(list = combined_name_copd, file = save_file_name)
+      }
+    }
+  } else if (disease == "asthma"){
+    for (var in vec){
+      for (horizon in 1:12) {
+        file_name = paste0("admission_rate_", disease, horizon, "_", var, "_050325.rdata")
+        load(file_name)
+        combined_asthma_df = submodels_asthma
+        
+        # Addition of Naive model
+        comparison_df = addition_of_naive(df_link = "combined_asthma_env_080225_norates.csv", disease = disease, outcome_var = "overall_rate_asthma",horizon=horizon,significant_predictors = asthma_discharge_significant_predictors)
+        if (identical(combined_asthma_df$actual, comparison_df$actual)) {
+            final_df = cbind(combined_asthma_df, comparison_df%>% dplyr::select(-actual))
+        }
+        
+        combined_name_asthma = paste0("admission_rate_", disease, horizon, "_", var, "_090325")
+        assign(combined_name_asthma, final_df)
+        save_file_name = paste0(combined_name_asthma, ".rdata")
+        save(list = combined_name_asthma, file = save_file_name)
+      }
+    }
+  }
+  return("Done")
+}
+
+renaming_fn(variables, "copd")
+renaming_fn(variables, "asthma")
+
+# Part 2: Combination to a single dataframe
+rm(list=ls())
+file_name = paste0("admission_rate_asthma12_exog_090325.rdata")
+load(file_name)
+exog_initial_col_names = colnames(admission_rate_asthma12_exog_090325)
+exog_temp_df = get(paste0("admission_rate_asthma12_exog_090325"))
+exog_temp_df$index = seq_len(nrow(exog_temp_df))
+exog_temp_df$horizon = 7
+exog_col_names = colnames(exog_temp_df)
+exog_len = length(exog_col_names)
+
+for (disease in c("copd","asthma")){
+  overall_df_combined = data.frame(matrix(ncol = exog_len, nrow = 0))
+  colnames(overall_df_combined) = exog_col_names
+  for (horizon in 1:12) {
+    file_name = paste0("admission_rate_", disease, horizon, "_exog", "_090325.rdata")
+    load(file_name)
+    temp_df = get(paste0("admission_rate_", disease, horizon, "_exog", "_090325"))
+    rownames(temp_df) = NULL
+    colnames(temp_df) = exog_initial_col_names
+    temp_df$index = seq_len(nrow(temp_df))
+    temp_df$horizon = horizon
+    overall_df_combined = rbind(overall_df_combined, temp_df)
+  }
+  overall_final_df = overall_df_combined %>%
+    rename("aml_predictions" = "aml_prediction") %>%
+    tidyr::fill(gam_lss_predictions, .direction = "down")
+  combined_name_var = paste0(disease, "_exog", "_combined_090325")
+  assign(combined_name_var, overall_final_df)
+  save_file_name = paste0(combined_name_var, ".rdata")
+  save(list = combined_name_var, file = save_file_name)
+}
+
+```
+
+# Formation of dataframes for aggregated factors
+- In this section, it details how to regenerate
+- Based on the forecasted admission rates, multiply it by the corresponding residents population for aggregation, then compare against the true overall rate
+
+```{r}
+rm(list=ls())
+gender_factors = c("female","male")
+copd_age_factors = c("age_55_to_64", "age_65_to_74", "age_75_to_84","age_85_above")
+asthma_age_factors = c("age_15_to_39", "age_40_to_54","age_55_to_64","age_65_to_74", "age_75_to_84", "age_85_above")
+
+for (var in c(copd_age_factors,gender_factors)){
+  file_name = paste0("copd_",var,"_all_280225.rdata")
+  load(file_name)
+}
+
+for (var in c(asthma_age_factors,gender_factors)){
+  file_name = paste0("asthma_",var,"_all_280225.rdata")
+  load(file_name)
+}
+
+data_editing_subgroups = function(df_filename, outcome, significant_predictors){
+  combined_df = read_csv(df_filename)%>%
+    column_to_rownames(var = "...1")
+  actual_outcome = sub("_([^_]+)$", "", outcome)
+  last_part = sub(".*_(.*)$", "\\1", outcome)
+  overall_rate = colnames(combined_df)[str_detect(colnames(combined_df), paste0(actual_outcome,"_residents","_",last_part))]
+  new_combined = combined_df %>% 
+    dplyr::select(overall_rate, significant_predictors)
+  return(new_combined)
+}
+
+data_editing_subgroups_cases = function(df_filename, outcome, significant_predictors){
+  combined_df = read_csv(df_filename)%>%
+    column_to_rownames(var = "...1")
+  new_combined = combined_df %>% 
+    dplyr::select(outcome, significant_predictors)
+  return(new_combined)
+}
+
+generate_lagged_df_subgroups = function(df, copd_lag_num, asthma_lag, env_lag, outcome){
+  lagged_df = df
+  lagged_cols_df = lagged_df %>%
+      dplyr::select(outcome) 
+  
+  # Customisation of function based off the outcome (COPD / Asthma)
+  if (str_detect(outcome, "copd")){
+    other_disease = "asthma"
+    outcome_lag = copd_lag_num
+    other_disease_lag = asthma_lag
+  } else if (str_detect(outcome, "asthma")){
+    other_disease = "copd"
+    outcome_lag = asthma_lag
+    other_disease_lag = copd_lag_num
+  }
+  
+  # Loop through all columns in the dataset
+  for (col in colnames(df)){
+    if (col == "year"|col == "week"){
+      next
+    } else if (col == outcome){
+      for (i in 1:outcome_lag){
+      lagged_col = dplyr::lag(df[[col]], i)
+      lagged_cols_df = lagged_cols_df %>% 
+        dplyr::mutate(!!paste0(col, "_L", i) := (lagged_col))
+      }
+    } else if (grepl(other_disease, col)){
+      for (i in 1:other_disease_lag){
+      lagged_col = dplyr::lag(df[[col]], i)
+      lagged_cols_df = lagged_cols_df %>% 
+        dplyr::mutate(!!paste0(col, "_L", i) := (lagged_col))
+      }
+    } else {
+      for (i in 1:env_lag){
+      lagged_col = dplyr::lag(df[[col]], i)
+      lagged_cols_df = lagged_cols_df %>% 
+        dplyr::mutate(!!paste0(col, "_L", i) := lagged_col)
+      }
+    }
+  }
+  lagged_df_final = na.omit(lagged_cols_df)
+  return(lagged_df_final)
+}
+
+create_stepped_dataset = function(df, horizon, outcome) {
+  shifted_df = df
+  y = dplyr::lead(shifted_df[[outcome]], n = (horizon - 1))
+  
+  if (horizon != 1) {
+    X = shifted_df[1:(nrow(shifted_df)-(horizon-1)),] # Removing the number of rows that y was shifted up
+  } else {
+    X = shifted_df
+  }
+  X = X %>% dplyr::select(-outcome) # Removing of outcome variable
+  y = na.omit(y)
+  
+  return(list(X = X, y = y))
+}
+
+copd_significant_predictors_1 = c("overall_rate_asthma", "MaxWind", "MeanWind", "MeanTemp", "MaxTemp", "MinTemp", "hot_week_indicator", "heat_wave_week", "Daily_Total_Rainfall")
+asthma_significant_predictors_1 = c("overall_rate_copd", "MaxWind", "MeanWind", "MeanTemp", "MaxTemp", "MinTemp", "hot_week_indicator", "heat_wave_week", "Daily_Total_Rainfall")
+
+# Extraction of residents column from the original dataframe
+generate_residents_fn = function(df_link, outcome_var, copd_lag_num = 1, asthma_lag = 1, env_lag = 1, horizon, training_limit=0.5, significant_predictors, cases = F, dis){
+  if (cases == T){
+    outcome_var = paste0("residents_",dis)
+    df = data_editing_subgroups_cases(df_link, outcome_var, significant_predictors = significant_predictors)
+  } else{
+    df = data_editing_subgroups(df_link, outcome_var, significant_predictors = significant_predictors)
+  }
+  
+  env_variables_to_lag = c("MaxWind", "MeanWind", "MaxTemp", "MinTemp", "MeanTemp", "hot_week_indicator", "heat_wave_week", "Daily_Total_Rainfall")
+  other_disease_var = setdiff(significant_predictors, 
+                             c(outcome_var, env_variables_to_lag))
+  
+  training_length = floor(nrow(df)*training_limit) # Number of observations used for training the data
+  initial_theta = 10
+  actual_outcome = sub("_([^_]+)$", "", outcome_var)
+  last_part = sub(".*_(.*)$", "\\1", outcome_var)
+  if (cases == F){
+    outcome_var = paste0(actual_outcome,"_residents","_",last_part)
+  }
+  
+  filtered_df = df %>% 
+    dplyr::select(outcome_var,all_of(significant_predictors))
+  
+  regression_model = generate_lagged_df_subgroups(filtered_df, copd_lag_num, asthma_lag, env_lag, outcome = outcome_var)
+  X_1 = create_stepped_dataset(regression_model, horizon, outcome = outcome_var)[[1]]
+  outcome_var_vec = create_stepped_dataset(regression_model, horizon, outcome = outcome_var)[[2]]
+  stepped_df = cbind(X_1, outcome_var_vec) # Combination to form stepped df
+  stepped_df = stepped_df %>% rename(!!outcome_var := "outcome_var_vec")
+  n = nrow(stepped_df) # Length of stepped df
+  stepped_df = stepped_df %>%
+    mutate(across(everything(), ~ ifelse(is.infinite(.) & . < 0, 0, .)))
+  
+  test_set = stepped_df[(training_length + 1):n,]
+  final_df = test_set %>%
+    dplyr::select(dplyr::matches("residents") & dplyr::matches("L1"))
+  return(final_df)
+}
+
+# Generation of full residents' df across all horizons
+overall_residents_df = function(df_link, outcome_var, copd_lag_num = 1, asthma_lag = 1, env_lag = 1, horizon, training_limit=0.5, significant_predictors,cases=F, dis = "copd"){
+  final_df = data.frame(matrix(ncol = 2, nrow = 0))
+  sample_df = generate_residents_fn(df_link, outcome_var, copd_lag_num = 1, asthma_lag = 1, env_lag = 1, horizon = 1, training_limit=0.5, significant_predictors = significant_predictors, cases, dis)
+  
+  colnames(final_df) = c(colnames(sample_df),"horizon")
+  for (horizon_num in 1:12){
+    to_add = generate_residents_fn(df_link, outcome_var, copd_lag_num = 1, asthma_lag = 1, env_lag = 1, horizon = horizon_num, training_limit=0.5, significant_predictors = significant_predictors, cases, dis)
+    to_add = to_add %>% mutate(horizon = horizon_num)
+    final_df = rbind(final_df, to_add)
+  }
+  return(final_df)
+}
+
+# multiplying / dividing by the corresponding residents column to obtain for aggregation
+combine_and_manipulate = function(residents_df, final_df, op = "multiply") {
+  # Assuming 'residents_df' has a column called 'residents' and 'final_df' has prediction columns.
+  final_df$residents = residents_df %>%
+    dplyr::select(dplyr::contains("residents")) %>%
+    pull()
+  if (op == "multiply"){
+    prediction_columns = c("actual", "naive_predictions", "ar_mixed_predictions", "gam_xgboost_predictions", "gam_lss_predictions", "glm_gamsel_predictions", "aml_predictions")
+  } else {
+    prediction_columns = c("actual", "naive_predictions", "ar_predictions", "gam_xgboost_predictions", "gam_lss_predictions", "glm_gamsel_predictions", "aml_predictions")
+  }
+  for (col in prediction_columns) {
+    if (op == "multiply"){
+      final_df[[col]] = final_df[[col]] * final_df$residents
+    } else if (op == "divide") {
+      final_df[[col]] = final_df[[col]] / final_df$residents
+    }
+  }
+  # Remove the residents column after multiplication
+  final_df = final_df %>% dplyr::select(-residents)
+  return(final_df)
+}
+
+# Extraction of predictions from individually forecasted
+ext_fn = function(disease, vec){
+  filename = paste0(disease,"_",vec,"_all_280225")
+  df = get(filename)
+  final_df = df %>%
+    dplyr::select(horizon, actual, naive_predictions, ar_mixed_predictions, gam_xgboost_predictions, gam_lss_predictions, glm_gamsel_predictions, aml_predictions)
+  return(final_df)
+}
+
+# Age
+for (dis in c("copd", "asthma")){
+  if (dis == "copd"){
+    first_var = copd_age_factors[1]
+    var_name = paste0(first_var,"_",dis)
+    residents_df = overall_residents_df("combined_asthma_env_080225_norates.csv", var_name, horizon, training_limit = 0.5, significant_predictors = copd_significant_predictors_1)
+    extracted_df = ext_fn(dis, first_var)
+    copd_age_combined_050325 = combine_and_manipulate(residents_df, extracted_df)
+    for (i in 2:length(copd_age_factors)){
+      var_in_loop = copd_age_factors[i]
+      var_name = paste0(var_in_loop,"_", dis)
+      residents_df = overall_residents_df("combined_asthma_env_080225_norates.csv", var_name, horizon, training_limit = 0.5, significant_predictors = copd_significant_predictors_1)
+      df_to_add = ext_fn(dis, var_in_loop)
+      df_to_add_new = combine_and_manipulate(residents_df, df_to_add)
+      copd_age_combined_050325 = copd_age_combined_050325 + df_to_add_new
+    }
+    copd_age_combined_050325 = copd_age_combined_050325 %>% 
+      mutate(horizon = horizon / length(copd_age_factors)) %>%
+      rename("ar_predictions" = "ar_mixed_predictions")
+    residents_overall = overall_residents_df("combined_asthma_env_080225_norates.csv", "", horizon, training_limit = 0.5, significant_predictors = copd_significant_predictors_1, cases = T, dis = "copd")
+    copd_age_combined_090325 = combine_and_manipulate(residents_overall, copd_age_combined_050325, op = "divide")
+  } else {
+    first_var = asthma_age_factors[1]
+    var_name = paste0(first_var,"_",dis)
+    residents_df = overall_residents_df("combined_asthma_env_080225_norates.csv", var_name, horizon, training_limit = 0.5, significant_predictors = asthma_significant_predictors_1)
+    extracted_df = ext_fn(dis, first_var)
+    asthma_age_combined_050325 = combine_and_manipulate(residents_df, extracted_df)
+    for (i in 2:length(asthma_age_factors)){
+      var_in_loop = asthma_age_factors[i]
+      var_name = paste0(var_in_loop,"_", dis)
+      residents_df = overall_residents_df("combined_asthma_env_080225_norates.csv", var_name, horizon, training_limit = 0.5, significant_predictors = asthma_significant_predictors_1)
+      df_to_add = ext_fn(dis, var_in_loop)
+      df_to_add_new = combine_and_manipulate(residents_df, df_to_add)
+      asthma_age_combined_050325 = asthma_age_combined_050325 + df_to_add_new
+    }
+    asthma_age_combined_050325 = asthma_age_combined_050325 %>% 
+      mutate(horizon = horizon / length(asthma_age_factors)) %>%
+      rename("ar_predictions" = "ar_mixed_predictions")
+    residents_overall = overall_residents_df("combined_asthma_env_080225_norates.csv", "", horizon, training_limit = 0.5, significant_predictors = asthma_significant_predictors_1, cases = T, dis = "asthma")
+    asthma_age_combined_090325 = combine_and_manipulate(residents_overall, asthma_age_combined_050325, op = "divide")
+  }
+}
+
+for (dis in c("copd", "asthma")){
+  if (dis == "copd"){
+    first_var = gender_factors[1]
+    var_name = paste0(first_var,"_",dis)
+    residents_df = overall_residents_df("combined_asthma_env_080225_norates.csv", var_name, horizon, training_limit = 0.5, significant_predictors = copd_significant_predictors_1)
+    extracted_df = ext_fn(dis, first_var)
+    copd_gender_combined_050325 = combine_and_manipulate(residents_df, extracted_df)
+    for (i in 2:length(gender_factors)){
+      var_in_loop = gender_factors[i]
+      var_name = paste0(var_in_loop,"_", dis)
+      residents_df = overall_residents_df("combined_asthma_env_080225_norates.csv", var_name, horizon, training_limit = 0.5, significant_predictors = copd_significant_predictors_1)
+      df_to_add = ext_fn(dis, var_in_loop)
+      df_to_add_new = combine_and_manipulate(residents_df, df_to_add)
+      copd_gender_combined_050325 = copd_gender_combined_050325 + df_to_add_new
+    }
+    copd_gender_combined_050325 = copd_gender_combined_050325 %>% 
+      mutate(horizon = horizon / length(gender_factors)) %>%
+      rename("ar_predictions" = "ar_mixed_predictions")
+    residents_overall = overall_residents_df("combined_asthma_env_080225_norates.csv", "", horizon, training_limit = 0.5, significant_predictors = copd_significant_predictors_1, cases = T, dis = "copd")
+    copd_gender_combined_090325 = combine_and_manipulate(residents_overall, copd_gender_combined_050325, op = "divide")
+  } else {
+    first_var = gender_factors[1]
+    var_name = paste0(first_var,"_",dis)
+    residents_df = overall_residents_df("combined_asthma_env_080225_norates.csv", var_name, horizon, training_limit = 0.5, significant_predictors = asthma_significant_predictors_1)
+    extracted_df = ext_fn(dis, first_var)
+    asthma_gender_combined_050325 = combine_and_manipulate(residents_df, extracted_df)
+    for (i in 2:length(gender_factors)){
+      var_in_loop = gender_factors[i]
+      var_name = paste0(var_in_loop,"_", dis)
+      residents_df = overall_residents_df("combined_asthma_env_080225_norates.csv", var_name, horizon, training_limit = 0.5, significant_predictors = asthma_significant_predictors_1)
+      df_to_add = ext_fn(dis, var_in_loop)
+      df_to_add_new = combine_and_manipulate(residents_df, df_to_add)
+      asthma_gender_combined_050325 = asthma_gender_combined_050325 + df_to_add_new
+    }
+    asthma_gender_combined_050325 = asthma_gender_combined_050325 %>% 
+      mutate(horizon = horizon / length(gender_factors)) %>%
+      rename("ar_predictions" = "ar_mixed_predictions")
+    residents_overall = overall_residents_df("combined_asthma_env_080225_norates.csv", "", horizon, training_limit = 0.5, significant_predictors = asthma_significant_predictors_1, cases = T, dis = "asthma")
+    asthma_gender_combined_090325 = combine_and_manipulate(residents_overall, asthma_gender_combined_050325, op = "divide")
+  }
+}
+
+# save(asthma_age_combined_090325, file = "asthma_age_combined_090325_new.rdata")
+# save(asthma_gender_combined_090325, file = "asthma_gender_combined_090325_new.rdata")
+# save(copd_age_combined_090325, file = "copd_age_combined_090325_new.rdata")
+# save(copd_gender_combined_090325, file = "copd_gender_combined_090325_new.rdata")
+```
+
+# Generation of Superensemble Models
+- Method 1: Equal Weights
+- Method 2: Median Weights
+- Method 3: Bates and Granger --> Inverse SE
+- Method 4: Bates and Granger --> Inverse Cumulative SE (Expanding Window)
+- Method 5: Trimmed Mean
+
+```{r}
+rm(list=ls())
+bates_granger_method_1 = function(df){
+  model_names = colnames(df)
+
+  # Filter names ending with "predictions" and remove the suffix
+  new_names = model_names %>%
+    str_subset("predictions$") %>%
+    str_remove("_predictions")
+  
+  final_df = df %>%
+    # group_by(horizon) %>%
+    rowwise() %>%
+    mutate(across(ends_with("predictions"), ~ (. - actual)^2, .names = "se_{str_remove(.col, '_predictions')}"),
+           across(ends_with("predictions"), ~ 1/((. - actual)^2), .names = "inv_se_{str_remove(.col, '_predictions')}"),
+           inv_se_sum = sum(c_across(starts_with("inv_se_")), na.rm = TRUE),
+           across(starts_with("inv_se_"), ~ ./inv_se_sum, .names = "norm_{str_remove(.col, '_predictions')}"),
+           across(starts_with("norm_"), ~if_else(is.nan(.), 1, .)))
+  
+  pred_col = paste0(new_names, "_predictions")
+  norm_col = paste0("norm_inv_se_", new_names)
+  pred_norm = final_df %>% dplyr::select(pred_col,norm_col,horizon)
+  # return(pred_norm)
+  final_weighted_preds = rowSums(map2_dfc(pred_col, norm_col, ~ {
+    pred_norm[[.x]] * pred_norm[[.y]]
+  }), na.rm = TRUE)
+  
+  return(final_weighted_preds)
+}
+
+bates_granger_method_2 = function(df){
+  model_names = colnames(df)
+
+  # Filter names ending with "predictions" and remove the suffix
+  new_names = model_names %>%
+    str_subset("predictions$") %>%
+    str_remove("_predictions")
+  
+  final_df = df %>%
+    rowwise() %>%
+    mutate(across(ends_with("predictions"), ~ (. - actual)^2, .names = "se_{str_remove(.col, '_predictions')}")) %>%
+    ungroup() %>%
+    group_by(horizon) %>%
+    mutate(across(starts_with("se"), cumsum, .names = "cumsum_{str_remove(.col, '_predictions')}")) %>%
+    ungroup() %>%
+    rowwise() %>%
+    mutate(across(starts_with("cumsum_"), ~ 1/., .names = "inv_{str_remove(.col, '_predictions')}"),
+           inv_se_sum = sum(c_across(starts_with("inv_cumsum_")), na.rm = TRUE),
+           across(starts_with("inv_cumsum_se_"), ~ ./inv_se_sum, .names = "norm_{str_remove(.col, '_predictions')}"),
+           across(starts_with("norm_"), ~if_else(is.nan(.), 1, .)))
+  # return(final_df)
+  pred_col = paste0(new_names, "_predictions")
+  norm_col = paste0("norm_inv_cumsum_se_", new_names)
+  pred_norm = final_df %>% dplyr::select(pred_col,norm_col)
+  # return(pred_norm)
+  final_weighted_preds = rowSums(map2_dfc(pred_col, norm_col, ~ {
+    pred_norm[[.x]] * pred_norm[[.y]]
+  }), na.rm = TRUE)
+  return(final_weighted_preds)
+}
+
+superensem_generator = function(df){
+  bg1_predictions = bates_granger_method_1(df)
+  bg2_predictions = bates_granger_method_2(df)
+  
+  final_df = df %>%
+    rowwise() %>%
+    mutate(eq_weights_predictions = rowMeans(across(ends_with("predictions")), na.rm = TRUE),
+           med_weights_predictions = median(c_across(ends_with("predictions")), na.rm = TRUE),
+           trimmed_mean_predictions = mean(  c_across(ends_with("predictions")), 
+      trim = 0.1,  # 10% trimmed mean
+      na.rm = TRUE))
+  final_df$bg1_predictions = bg1_predictions
+  final_df$bg2_predictions = bg2_predictions
+  return(final_df)
+}
+
+```
+
+# Analysis 1
+```{r}
+# rm(list=ls())
+final_var_1 = c("exog", "noexog")
+
+for (dis in c("copd","asthma")){
+  for (var in final_var_1){
+    file_name = paste0(dis, "_", var, "_combined_090325.rdata")
+    load(file_name)
+    df = get(paste0(dis,"_", var, "_combined_090325"))
+    final_df = superensem_generator(df)
+    combined_name = paste0(dis,"_", var, "_combined_all_090325")
+    assign(combined_name, final_df)
+    save_file_name = paste0(combined_name, ".rdata")
+    save(list = combined_name, file = save_file_name)
+  }
+}
+```
+
+# Analysis 2
+```{r}
+# final_var_2 = c("age_exog", "age", "gender_exog", "gender")
+final_var_2 = c("age", "gender")
+
+for (dis in c("copd","asthma")){
+  for (var in final_var_2){
+    file_name = paste0(dis, "_", var, "_combined_090325_new.rdata")
+    load(file_name)
+    df = get(paste0(dis,"_", var, "_combined_090325"))
+    final_df = superensem_generator(df)
+    combined_name = paste0(dis,"_", var, "_combined_all_090325")
+    assign(combined_name, final_df)
+    save_file_name = paste0(combined_name, ".rdata")
+    save(list = combined_name, file = save_file_name)
+  }
+}
+```

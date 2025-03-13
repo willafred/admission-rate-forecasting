@@ -1,0 +1,345 @@
+---
+title: "Data Exploration"
+output: html_document
+date: "2024-09-16"
+---
+
+# Description of Overall Coding File
+
+This file details the process of preparation of the combined dataset for Asthma and COPD-related factors. 
+
+Environmental data is also called from weather.gov.sg using API. Environmental data was collated from multiple weather stations in Singapore, and aggregated to obtain the respective measures.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+library(tidyverse)
+library(stringr)
+library(MASS)
+library(readxl)
+library(httr)
+library(jsonlite)
+library(lubridate)
+library(tidyr)
+library(ISOweek)
+library(zoo)
+```
+
+## Loading Dataframes
+
+We first load the original data alongside the introduction to the conversion of week columns to epiweek. Apart from that, we also prepared the custom aggregate function to prepare the weather data (API-called).
+
+```{r}
+copd_df = read_excel("COPD_admissions_2012_2023.xlsx")
+asthma_df = read_excel("Asthma_admissions_2012_2023.xlsx")
+
+# Function to compute epiweek
+compute_epiweek = function(year, month, day) {
+  date = as.Date(sprintf("%04d-%02d-%02d", year, month, day))
+  start_of_year = as.Date(sprintf("%04d-01-01", year))
+  day_diff = as.numeric(difftime(date, start_of_year, units = "days"))
+  week_number = floor(day_diff / 7) + 1
+  if (week_number == 53){
+    week_num_new = 52
+    return(week_num_new)
+  }
+  return(week_number)
+}
+
+# Function to convert YYYYWW to Week object
+convert_to_epiweek = function(yyyww) {
+  year = as.integer(substr(yyyww, 1, 4))
+  week = as.integer(substr(yyyww, 5, 6))
+  iso_week_str = sprintf("%d%02d", year, week)
+  return(iso_week_str)
+}
+
+# Aggregation function for Weather Data
+custom_agg = function(column, col_name) {
+  if (grepl("Max|Maximum|Highest", col_name)) {
+    return(max(column, na.rm = TRUE))
+  } else if (grepl("Min|Minimum", col_name)) {
+    filtered_column = column[column > 0]
+    return(min(filtered_column, na.rm = TRUE))
+  } else {
+    return(mean(column, na.rm = TRUE))
+  }
+}
+```
+
+## Calling of API to get data from weather.gov.sg
+
+Calling of API to get environmental data - it is to note that on particular days some weather stations may not record the data too!
+
+```{r}
+# res = GET('https://www.weather.gov.sg/files/dailydata/DAILYDATA_S06_201904.csv')
+# status_code(res)
+# writeBin(content(res, "raw"), "dailydata.csv")
+# final_df <- read_csv("dailydata.csv", locale = locale(encoding = "ISO-8859-1"))
+# final_df <- final_df %>%
+#   mutate(across(everything(), as.character)) %>%
+#   mutate(across(everything(), ~na_if(.x, "—"))) %>%
+#   mutate(across(everything(), ~na_if(.x, "\x97")))%>%
+#   mutate(across(everything(), ~na_if(.x, "\u0097")))
+
+generate_csv = function(url) {
+  response = GET(url)
+  if (status_code(response) == 200) {
+    writeBin(content(response, "raw"), "dailydata.csv")
+    final_df = read_csv("dailydata.csv", locale = locale(encoding = "ISO-8859-1"))
+    final_df = final_df %>%
+      mutate(across(everything(), as.character)) %>%
+      mutate(across(everything(), ~na_if(.x, "—"))) %>%
+      mutate(across(everything(), ~na_if(.x, "\x97"))) %>%
+      mutate(across(everything(), ~na_if(.x, "\u0097")))
+    
+    return(final_df)
+  } else {
+    return(NULL)
+  }
+}
+
+# Define column names (assuming the first call to generate_csv retrieves the columns)
+final_df = generate_csv('https://www.weather.gov.sg/files/dailydata/DAILYDATA_S50_201508.csv')
+col_names = names(final_df)
+
+# Loop to construct URLs and collect data
+for (i in 1:130) {
+  if (i < 10) {
+    country_code = paste0("S0", i)
+  } else {
+    country_code = paste0("S", i)
+  }
+  
+  for (year in 2012:2023) {
+    for (month in 1:12) {
+      year_month = sprintf("%04d%02d", year, month)
+      url = paste0('https://www.weather.gov.sg/files/dailydata/DAILYDATA_', country_code, '_', year_month, '.csv')
+      url_csv = generate_csv(url)
+      
+      if (!is.null(url_csv)) {
+        # Ensure columns match
+        colnames(url_csv) = col_names
+        final_df = rbind(final_df, url_csv)
+      }
+    }
+  }
+}
+
+```
+
+## Cleaning of Environmental Dataset
+
+Performance of the following functions
+- Computation of Epiweek Function
+- Aggregation of Environmental Variables
+- Generation of heat-related variables (weeks containing days of EXTREME heat, and heat-wave weeks)
+
+```{r pressure, echo=FALSE}
+# Read the CSV file
+df_original = read.csv("r_called_env_variables.csv")
+
+# Cleaning of environmental data
+env_data_cleaning = function(df) {
+  
+  df = df %>%
+    distinct() %>%
+    drop_na(Year, Month, Day) %>%
+    mutate(across(c(Year, Month, Day), as.integer)) %>%
+    dplyr::select(-Station) %>%
+    mutate(across(everything(), ~ as.numeric(.)))
+  
+  # Apply epiweek calculation
+  df = df %>%
+    rowwise() %>%
+    mutate(EpiWeek = compute_epiweek(Year, Month, Day)) %>%
+    ungroup() %>%
+    mutate(EpiWeek_str = sprintf("%02d", EpiWeek),
+           year_str = sprintf("%02d", Year),
+           epiweek_str = paste0(year_str, EpiWeek_str),
+           epiweek = convert_to_epiweek(epiweek_str)) %>%
+    dplyr::select(-epiweek_str, -EpiWeek_str, -year_str, -EpiWeek, -Year, -Day, -Month)
+  
+  # Aggregation function to compute functions
+  env_variables = df %>%
+     group_by(epiweek) %>%
+     summarise(across(everything(), ~ custom_agg(., cur_column()), .names = "{col}")) %>%
+     column_to_rownames(var = "epiweek") %>%
+     dplyr::select(-c(2,3,4))
+    
+  colnames(env_variables) = c("Daily Total Rainfall (mm)", "MeanTemp (C)", "MaxTemp (C)", "MinTemp (C)", "MeanWind (kmh)", "MaxWind (kmh)")
+  return(env_variables)
+}
+colnames(df_original)
+
+heat_variables = function(df) {
+  df_rolling = df %>%
+    distinct() %>%
+    drop_na(Year, Month, Day) %>%
+    mutate(across(c(Year, Month, Day), as.integer)) %>%
+    dplyr::select(-Station) %>%
+    mutate(across(everything(), ~ as.numeric(.))) %>%
+    dplyr::select(Year, Month, Day, "Maximum.Temperature...C.", "Mean.Temperature...C.") %>%
+    drop_na("Maximum.Temperature...C.", "Mean.Temperature...C.") %>%
+    ungroup() %>%
+    group_by(Year,Month,Day) %>%
+    rename("MaxTemp" = "Maximum.Temperature...C.",
+           "MeanTemp" = "Mean.Temperature...C.") %>%
+    summarise(MaxTemp = max(MaxTemp,na.rm=T),
+           MeanTemp = mean(MeanTemp,na.rm=T),
+           .groups = "drop") %>%
+    mutate(very_hot_day = ifelse(MaxTemp > 33, 1, 0),
+           AvgMaxTemp = rollapply(MaxTemp, width = 3, FUN = mean, align = "right", fill = NA),
+           AvgMeanTemp = rollapply(MeanTemp, width = 3, FUN = mean, align = "right", fill = NA)) %>%
+    mutate(heat_wave = ifelse(AvgMaxTemp >= 35 & AvgMeanTemp >= 29, 1, 0))
+  
+  # Apply epiweek calculation
+  df_int = df_rolling %>%
+    rowwise() %>%
+    mutate(EpiWeek = compute_epiweek(Year, Month, Day)) %>%
+    ungroup() %>%
+    mutate(EpiWeek_str = sprintf("%02d", EpiWeek),
+           year_str = sprintf("%02d", Year),
+           epiweek_str = paste0(year_str, EpiWeek_str),
+           epiweek = convert_to_epiweek(epiweek_str)) %>%
+    dplyr::select(-epiweek_str, -EpiWeek_str, -year_str, -EpiWeek, -Year, -Day, -Month) %>%
+    ungroup() %>%
+    group_by(epiweek) %>%
+    summarise(hot_week = sum(very_hot_day,na.rm=T),
+           heat_wave = sum(heat_wave,na.rm=T),
+           hot_week_indicator = ifelse(hot_week > 0, 1, 0),
+           heat_wave_week = ifelse(heat_wave > 0, 1, 0)) %>%
+    dplyr::select(-c(hot_week, heat_wave))
+  env_variables = df_int %>% column_to_rownames(var = "epiweek")
+  return(env_variables)
+}
+env_variables = env_data_cleaning(df_original)
+additional_variables = heat_variables(df_original)
+merged_df = merge(env_variables, additional_variables, by = "row.names")
+rownames(merged_df) = merged_df$Row.names
+merged_df = merged_df %>% dplyr::select(-Row.names)
+# Save to CSV if needed
+write.csv(merged_df, "env_variables_clean_220924.csv")
+
+
+```
+
+# Cleaning of COPD and Asthma Dataframes, and merging of dataframes with environmental variables
+- Renaming of COPD and Asthma Dataframes to ensure no overlap in columns
+- Merging of COPD, Asthma, Environment Dataframe to form a combined dataframe
+- Conversion of raw discharges to that of 7 days (for final week of each year). This is because some weeks have more than 7 days given that the data procurers considered 1 January as the first day of the first week in the year (hence final week of the years may not have 7 days).
+
+```{r}
+# colnames(asthma_df)
+# asthma_df[1,]
+colnames_copd = c("year","week","admissions","residents","overall_rate",
+                  "age_40_to_54_admissions","age_55_to_64_admissions","age_65_to_74_admissions",
+                  "age_75_to_84_admissions","age_85_above_admissions", "female_admissions","male_admissions",
+                  "age_40_to_54_residents","age_55_to_64_residents","age_65_to_74_residents",
+                  "age_75_to_84_residents","age_85_above_residents","female_residents","male_residents",
+                  "age_40_to_54_overall_rate","age_55_to_64_overall_rate","age_65_to_74_overall_rate",
+                  "age_75_to_84_overall_rate","age_85_above_overall_rate","female_overall_rate","male_overall_rate")
+colnames_asthma = c("year","week","admissions","residents","overall_rate",
+                    "age_0_to_14_admissions","age_15_to_39_admissions",
+                    "age_40_to_54_admissions","age_55_to_64_admissions","age_65_to_74_admissions",
+                    "age_75_to_84_admissions","age_85_above_admissions", "female_admissions","male_admissions",
+                    "age_0_to_14_residents","age_15_to_39_residents",
+                    "age_40_to_54_residents","age_55_to_64_residents","age_65_to_74_residents",
+                    "age_75_to_84_residents","age_85_above_residents","female_residents","male_residents",
+                    "age_0_to_14_overall_rate","age_15_to_39_overall_rate",
+                    "age_40_to_54_overall_rate","age_55_to_64_overall_rate","age_65_to_74_overall_rate",
+                    "age_75_to_84_overall_rate","age_85_above_overall_rate",
+                    "female_overall_rate","male_overall_rate")
+colnames(copd_df) = colnames_copd
+colnames(asthma_df) = colnames_asthma
+copd_df_1 = copd_df[2:nrow(copd_df),]
+asthma_df_1 = asthma_df[2:nrow(asthma_df),]
+
+data_cleaning = function(df,df_type) {
+  rename_columns = function(col, name) {
+    if (!(name %in% col) && col != "epiweek") {
+      return(paste0(col, "_", name))
+    }
+    return(col)
+  }
+  # Create week and year strings
+  df = df %>%
+    mutate(
+      week_str = sprintf("%02d", week),
+      year_str = sprintf("%02d", year),
+      epiweek_str = paste0(year_str, week_str),
+      epiweek = sapply(epiweek_str, convert_to_epiweek)
+    ) %>%
+    # Drop unnecessary columns
+    dplyr::select(-epiweek_str, -week_str, -year_str, week, year) %>%
+    # Move epiweek to the first column and set it as the row name
+    relocate(epiweek) %>%
+    column_to_rownames(var = "epiweek") %>% 
+    rename_with(~ sapply(., rename_columns, df_type), .cols = everything())
+  
+  return(df)
+}
+
+final_week_days = function(year){
+  start = paste0('01/01/',as.character(year))
+  start = as.Date(start,format = '%m/%d/%Y')
+  end = paste0('12/31/',as.character(year))
+  end = as.Date(end,format = '%m/%d/%Y')
+  days = end-start
+  final_week = (as.numeric(days)+1)-51*7
+  return(final_week)
+}
+
+# Counting the number of days within each week (for renormalisation)
+days_df = function(start_year,end_year){
+  overall = data.frame(matrix(nrow=0,ncol=2))
+  colnames(overall) = c("week","num_days")
+  for (year in start_year:end_year){
+    for (week in 1:52){
+      if (week < 10){
+        week_str = paste0("0",as.character(week))
+      } else {
+        week_str = as.character(week)
+      }
+      time = paste0(as.character(year),week_str)
+      if (week == 52){
+        to_add = data.frame(week = time, num_days = final_week_days(year))
+      } else {
+        to_add = data.frame(week = time, num_days = 7)
+      }
+      overall = rbind(overall,to_add)
+    }
+  }
+  return(overall)
+}
+
+days = days_df(2012,2023)
+
+copd_clean = data_cleaning(copd_df_1,"COPD")
+asthma_clean = data_cleaning(asthma_df_1,"asthma")
+
+copd_clean$rownames = rownames(copd_clean)
+asthma_clean$rownames = rownames(asthma_clean)
+env_dataset = read.csv("env_variables_clean_220924.csv") %>% rename("rownames" = "X") %>% mutate(rownames=as.character(rownames))
+colnames(env_dataset) = c("rownames","Daily_Total_Rainfall","MeanTemp","MaxTemp","MinTemp","MeanWind","MaxWind","hot_week_indicator","heat_wave_week")
+
+combined_df = copd_clean %>% 
+  left_join(asthma_clean, by = c("rownames","year_COPD" = "year_asthma","week_COPD" = "week_asthma")) %>% 
+  left_join(env_dataset,by="rownames") %>% 
+  left_join(days, by=c("rownames" = "week")) %>% 
+  column_to_rownames(var = "rownames") %>%
+  rename("year" = "year_COPD",
+         "week" = "week_COPD")
+
+combined_df_edited = combined_df %>%
+  # dplyr::select(-matches("overall_rate")) %>%
+  mutate(across(contains("admissions"), ~ ceiling((. / num_days) * 7))) %>%
+  dplyr::select(-num_days) %>%
+  rename("cases_copd" = "admissions_COPD",
+         "cases_asthma" = "admissions_asthma") %>%
+  rename_with(~ gsub("_COPD", "_copd", .), contains("_COPD")) %>%
+  rename_with(~ gsub("_admissions", "", .), contains("_admissions"))
+  
+# Saving final dataframe
+write.csv(combined_df_edited,"combined_asthma_env_080225_norates.csv")
+```

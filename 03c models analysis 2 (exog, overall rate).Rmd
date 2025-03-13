@@ -1,0 +1,499 @@
+---
+title: "03 models UPDATED"
+output: html_document
+date: "2024-12-06"
+---
+
+In this file, we focus on the generation of h-weeks ahead forecasts for Exogenous variables from Analysis 2.
+
+The following steps were performed:
+(1) Generation of the following functions to better facilitate forecast generation
+- Cleaning of dataframe (remove irrelevant columns since only overall subgroup admission rates are used for analysis)
+- Lagged dataframe (lagged covariates) 
+- Stepped dataframe with the corresponding h-step ahead forecast (for given horizon h)
+
+(2) Main Function for models
+- AR (Pure) --> only lagged outcome variables as covariates
+- AR (Other Disease) --> only lagged outcome and lagged (other) disease variables as covariates
+- AR (Env) --> only lagged outcome and lagged environmental variables as covariates
+- AR (Mixed) --> lagged outcome, lagged (other) disease, and lagged environmental variables as covariates
+- GAMLSS
+- GLM-GAMSEL
+- GAM-XGBoost
+- MLP
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+packages = c("tidyverse", "stringr", "MASS", "readxl", "httr", "jsonlite", 
+              "lubridate", "tidyr", "ISOweek", "ggplot2", "viridis", "mgcv", 
+              "tseries", "glmnet", "randomForest", "grf", "gamlss", "doParallel", 
+              "foreach", "xgboost", "automl", "gamsel", "h2o")
+
+# Function to check, install if needed, and load libraries
+install_and_load = function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# Apply function to all packages
+sapply(packages, install_and_load)
+setwd("C:/Users/wjlwi/OneDrive/Desktop/NTU Intern Final/to_wilfred/paper")
+
+combined_df = read_csv("combined_asthma_env_080225_norates.csv")
+
+# Significant predictors for the different diseases
+copd_discharge_significant_predictors = c("overall_rate_asthma", "female_overall_rate_asthma", "male_overall_rate_asthma", "MaxWind", "MeanWind", "MeanTemp", "MaxTemp", "MinTemp", "hot_week_indicator", "heat_wave_week", "Daily_Total_Rainfall","age_15_to_39_overall_rate_asthma", "age_40_to_54_overall_rate_asthma", "age_55_to_64_overall_rate_asthma", "age_65_to_74_overall_rate_asthma", "age_75_to_84_overall_rate_asthma", "age_85_above_overall_rate_asthma")
+
+asthma_discharge_significant_predictors = c("overall_rate_copd", "female_overall_rate_copd", "male_overall_rate_copd", "age_55_to_64_overall_rate_copd", "age_65_to_74_overall_rate_copd", "age_75_to_84_overall_rate_copd","age_85_above_overall_rate_copd", "MaxWind", "MeanWind", "MeanTemp", "MaxTemp", "MinTemp", "hot_week_indicator", "heat_wave_week", "Daily_Total_Rainfall")
+```
+
+# Step 1: Generation of Relevant Functions
+Introduction to functions involved in the forecast generation:
+- Cleaning of dataframe (remove irrelevant columns since only overall subgroup admission rates are used for analysis)
+- Lagged dataframe (lagged covariates) 
+- Stepped dataframe with the corresponding h-step ahead forecast (for given horizon h)
+```{r}
+data_editing_subgroups = function(df_filename, outcome, significant_predictors){
+  combined_df = read_csv(df_filename)%>%
+    column_to_rownames(var = "...1")
+  actual_outcome = sub("_([^_]+)$", "", outcome)
+  last_part = sub(".*_(.*)$", "\\1", outcome)
+  new_combined = combined_df %>% 
+    dplyr::select(year, week, outcome, significant_predictors)
+  return(new_combined)
+}
+
+generate_lagged_df_subgroups = function(df, copd_lag_num, asthma_lag, env_lag, outcome){
+  lagged_df = df
+  lagged_cols_df = lagged_df %>%
+      dplyr::select(outcome) 
+  
+  # Customisation of function based off the outcome (COPD / Asthma)
+  if (str_detect(outcome, "copd")){
+    other_disease = "asthma"
+    outcome_lag = copd_lag_num
+    other_disease_lag = asthma_lag
+  } else if (str_detect(outcome, "asthma")){
+    other_disease = "copd"
+    outcome_lag = asthma_lag
+    other_disease_lag = copd_lag_num
+  }
+  
+  # Loop through all columns in the dataset
+  for (col in colnames(df)){
+    if (col == "year"|col == "week"){
+      next
+    } else if (col == outcome){
+      for (i in 1:outcome_lag){
+      lagged_col = dplyr::lag(df[[col]], i)
+      lagged_cols_df = lagged_cols_df %>% 
+        dplyr::mutate(!!paste0(col, "_L", i) := (lagged_col))
+      }
+    } else if (grepl(other_disease, col)){
+      for (i in 1:other_disease_lag){
+      lagged_col = dplyr::lag(df[[col]], i)
+      lagged_cols_df = lagged_cols_df %>% 
+        dplyr::mutate(!!paste0(col, "_L", i) := (lagged_col))
+      }
+    } else {
+      for (i in 1:env_lag){
+      lagged_col = dplyr::lag(df[[col]], i)
+      lagged_cols_df = lagged_cols_df %>% 
+        dplyr::mutate(!!paste0(col, "_L", i) := lagged_col)
+      }
+    }
+  }
+  lagged_df_final = na.omit(lagged_cols_df)
+  return(lagged_df_final)
+}
+
+create_stepped_dataset = function(df, horizon, outcome) {
+  shifted_df = df
+  y = dplyr::lead(shifted_df[[outcome]], n = (horizon - 1))
+  
+  if (horizon != 1) {
+    X = shifted_df[1:(nrow(shifted_df)-(horizon-1)),] # Removing the number of rows that y was shifted up
+  } else {
+    X = shifted_df
+  }
+  X = X %>% dplyr::select(-outcome) # Removing of outcome variable
+  y = na.omit(y)
+  
+  return(list(X = X, y = y))
+}
+```
+
+# Step 2: Main Function for models
+
+The function for this chunk describes the overall function for the h-week ahead forecasting of the overall admission rates for Asthma and COPD cases for a given week.
+```{r}
+num_cores = detectCores() 
+cl = makeCluster(num_cores)
+registerDoParallel(cl)
+
+regression_model_fn_exog = function(df_link, outcome_var, copd_lag_num = 1, asthma_lag = 1, env_lag = 1, horizon, training_limit=0.5, significant_predictors){
+  df = read_csv(df_link)
+  env_variables_to_lag = c("MaxWind", "MeanWind", "MaxTemp", "MinTemp", "MeanTemp", "hot_week_indicator", "heat_wave_week", "Daily_Total_Rainfall")
+  other_disease_var = setdiff(significant_predictors, 
+                             c(outcome_var, env_variables_to_lag))
+  
+  if (str_detect(outcome_var, 'copd')){
+    dis_popn = "residents_copd"
+    lagged_disease_popn = "residents_copd_L1"
+  } else{
+    dis_popn = "residents_asthma"
+    lagged_disease_popn = "residents_asthma_L1"
+  }
+  training_length = floor(nrow(df)*training_limit) # Number of observations used for training the data
+  
+  initial_theta = 10
+
+  filtered_df = df %>% 
+    dplyr::select(year,week,outcome_var,all_of(significant_predictors))
+  
+  regression_model = generate_lagged_df_subgroups(filtered_df, copd_lag_num, asthma_lag, env_lag, outcome = outcome_var)
+  X_1 = create_stepped_dataset(regression_model, horizon, outcome = outcome_var)[[1]]
+  outcome_var_vec = create_stepped_dataset(regression_model, horizon, outcome = outcome_var)[[2]]
+  stepped_df = cbind(X_1, outcome_var_vec) # Combination to form stepped df
+  stepped_df = stepped_df %>% rename(!!outcome_var := "outcome_var_vec")
+  
+  n = nrow(stepped_df) # Length of stepped df
+  stepped_df = stepped_df %>%
+    mutate(across(everything(), ~ ifelse(is.infinite(.) & . < 0, 0, .)))
+  
+  results = foreach(i = (training_length):(n-1), .combine = rbind, .packages = c("dplyr", "mgcv","stringr","gamlss","gamsel","MASS","xgboost","h2o")) %dopar% {
+  # for (i in (training_length+102):(training_length+105)){
+    # Standardising variables if it is not the dependent variable and the disease population
+    standardize_data = function(train_set, test_set, outcome) {
+      # Extract covariate columns (excluding the outcome variable)
+      binary_vars = c("heat_wave_week", "hot_week_indicator")
+      covariates = setdiff(names(train_set), c(outcome, binary_vars))
+  
+      # Compute means and standard deviations of covariates from the training set
+      train_means = sapply(train_set[covariates], mean, na.rm = TRUE)
+      train_sds = sapply(train_set[covariates], sd, na.rm = TRUE)
+  
+      # Standardize training set
+      train_set[covariates] = sweep(train_set[covariates], 2, train_means, "-")
+      train_set[covariates] = sweep(train_set[covariates], 2, train_sds, "/")
+  
+      # Standardize test set using training set parameters
+      test_set[covariates] = sweep(test_set[covariates], 2, train_means, "-")
+      test_set[covariates] = sweep(test_set[covariates], 2, train_sds, "/")
+      # Return standardized datasets
+      list(train_set = train_set, test_set = test_set)
+    }
+
+    train_set = stepped_df[1:i, ]
+    test_set = stepped_df[(i + 1), ]
+    testing_set = test_set %>% dplyr::select(-c(outcome_var))
+    train_standardised = standardize_data(train_set,testing_set,outcome = outcome_var)[[1]]
+    test_standardised = standardize_data(train_set,testing_set,outcome = outcome_var)[[2]]
+    # return(train_set)
+    # Model 1: Mixed AR
+    if (str_detect(outcome_var,"copd")){
+      pure_ar_variables_to_lag = c(paste0("s(",outcome_var))
+      pure_ar_lagged_terms = unlist(lapply(pure_ar_variables_to_lag, function(var) {
+        paste0(var, "_L", 1:copd_lag_num)
+      }))
+      pure_ar_formula_str = paste0(outcome_var, " ~ ", paste(paste0(pure_ar_lagged_terms, ")"), collapse = " + "))
+      
+    } else if (str_detect(outcome_var,"asthma")){
+      pure_ar_variables_to_lag = c(paste0("s(",outcome_var))
+      pure_ar_lagged_terms = unlist(lapply(pure_ar_variables_to_lag, function(var) {
+        paste0(var, "_L", 1:asthma_lag)
+      }))
+      
+      pure_ar_formula_str = paste0(outcome_var, " ~ ", paste(paste0(pure_ar_lagged_terms, ")"), collapse = " + "))
+    }
+    
+    other_disease_var_s = paste0("s(", other_disease_var)
+    other_disease_lagged_terms = unlist(lapply(other_disease_var_s, function(var) {
+      paste0(var, "_L", 1:asthma_lag)
+    }))
+
+    ar_other_disease_formula_str = paste(pure_ar_formula_str, "+", paste(paste0(other_disease_lagged_terms, ")"), collapse = " + "))
+    # return(ar_other_disease_formula_str)
+    
+    env_variables_to_lag_s = ifelse(env_variables_to_lag %in% c("hot_week_indicator", "heat_wave_week"), 
+                                  env_variables_to_lag, 
+                                  paste0("s(", env_variables_to_lag))
+    env_lagged_terms = unlist(lapply(env_variables_to_lag_s, function(var) {
+      if (startsWith(var, "s(")) {
+        paste0(var, "_L", 1:env_lag, ")") # Add lag and closing parenthesis
+      } else {
+        paste0(var, "_L", 1:env_lag)      # Only add lag for non-smooth terms
+      }
+    }))
+    
+    # Create the formula string
+    ar_env_formula_str = paste(pure_ar_formula_str, "+", paste(env_lagged_terms, collapse = " + "))
+    
+    if (str_detect(outcome_var,"copd")){
+      other_disease_var_s = paste0("s(", other_disease_var)
+      other_disease_lagged_terms = unlist(lapply(other_disease_var_s, function(var) {
+        paste0(var, "_L", 1:asthma_lag)
+      }))
+    } else if (str_detect(outcome_var,"asthma")){
+      other_disease_var_s = paste0("s(", other_disease_var)
+      other_disease_lagged_terms = unlist(lapply(other_disease_var_s, function(var) {
+        paste0(var, "_L", 1:copd_lag_num)
+      }))
+    }
+    
+    env_variables_to_lag_s = ifelse(env_variables_to_lag %in% c("hot_week_indicator", "heat_wave_week"), 
+                                  env_variables_to_lag, 
+                                  paste0("s(", env_variables_to_lag))
+    env_lagged_terms = unlist(lapply(env_variables_to_lag_s, function(var) {
+      if (startsWith(var, "s(")) {
+        paste0(var, "_L", 1:env_lag, ")") # Add lag and closing parenthesis
+      } else {
+        paste0(var, "_L", 1:env_lag)      # Only add lag for non-smooth terms
+      }
+    }))
+    
+    # Create the formula string
+    ar_env_formula_str = paste(pure_ar_formula_str, "+", paste(env_lagged_terms, collapse = " + "))
+    
+    ar_mixed_formula_str = paste(pure_ar_formula_str, "+", paste(env_lagged_terms, collapse = " + "),"+", paste(paste0(other_disease_lagged_terms, ")"), collapse = " + "))
+    print(ar_mixed_formula_str)
+    print("Formula")
+    # return(train_standardised)
+    ar_mixed_model = bam(as.formula(ar_mixed_formula_str), family = gaussian(), data = train_standardised)
+    print("Fitted")
+    # Predict on the test set
+    ar_mixed_predictions = predict(ar_mixed_model, newdata = test_standardised, type = "response")
+    
+    # Model 3: GAMLSS Model
+    
+    mean_matched_columns = unlist(lapply(significant_predictors, function(predictor) {
+      grep(predictor, colnames(stepped_df), value = TRUE)
+    }))
+    # return(mean_matched_columns)
+    if (str_detect(outcome_var,"copd")){
+      model7_variables_to_lag = c(paste0("pb(",outcome_var))
+      model7_lagged_terms = unlist(lapply(model7_variables_to_lag, function(var) {
+        paste0(var, "_L", 1:copd_lag_num)
+      }))
+      
+      base_terms = paste0(outcome_var, " ~ ", paste(paste0(model7_lagged_terms, ")"), collapse = " + "))
+      
+    } else if (str_detect(outcome_var,"asthma")){
+      model7_variables_to_lag = c(paste0("pb(",outcome_var))
+      # model7_variables_to_lag = c("pb(cases_asthma")
+      model7_lagged_terms = unlist(lapply(model7_variables_to_lag, function(var) {
+        paste0(var, "_L", 1:asthma_lag)
+      }))
+      
+      base_terms = paste0(outcome_var, " ~ ", paste(paste0(model7_lagged_terms, ")"), collapse = " + "))
+    }
+    
+    mean_terms = paste0("pb(", mean_matched_columns, ")")
+    # return(mean_terms)
+    
+    mu_formula_string = paste(c(base_terms, mean_terms), collapse = " + ")
+    
+    overall_formula = as.formula(mu_formula_string)
+    print(paste0("GAMLSS:", mu_formula_string))
+    # return(overall_formula)
+    gam_lss_predictions = tryCatch({
+      # Fit the GAMLSS model and make predictions if no error
+      gam_lss_obj = gamlss(overall_formula, family = NO(), data = train_standardised)
+      print("GAMLSS Fitted")
+      predict(object = gam_lss_obj,
+              what = "mu",
+              data = train_standardised, newdata = test_standardised, type = "response")
+    }, error = function(e) {
+      # If an error occurs, return NA
+      cat("Error: ", e$message, "\n")
+      return(NA)
+    })
+    print("GAMLSS Done")
+    
+    # Model 4: 2-step forecasting: GLM-GAMSEL
+    
+    if (str_detect(outcome_var,"copd")){
+      pure_ar_variables_to_lag_ns = c(outcome_var)
+      pure_ar_lagged_terms_ns = unlist(lapply(pure_ar_variables_to_lag_ns, function(var) {
+        paste0(var, "_L", 1:copd_lag_num)
+      }))
+      
+      pure_ar_formula_str_ns = paste0(outcome_var, " ~ ", paste(pure_ar_lagged_terms_ns, collapse = " + "))
+      
+      other_disease_var_ns = other_disease_var
+      other_disease_lagged_terms_ns = unlist(lapply(other_disease_var_ns, function(var) {
+        paste0(var, "_L", 1:asthma_lag)
+      }))
+    } else if (str_detect(outcome_var,"asthma")){
+      pure_ar_variables_to_lag_ns = c(outcome_var)
+      pure_ar_lagged_terms_ns = unlist(lapply(pure_ar_variables_to_lag_ns, function(var) {
+        paste0(var, "_L", 1:asthma_lag)
+      }))
+      
+      pure_ar_formula_str_ns = paste0(outcome_var, " ~ ", paste(pure_ar_lagged_terms_ns, collapse = " + "))
+      
+      other_disease_var_ns = other_disease_var
+      other_disease_lagged_terms_ns = unlist(lapply(other_disease_var_ns, function(var) {
+        paste0(var, "_L", 1:copd_lag_num)
+      }))
+    }
+    env_variables_to_lag_ns = env_variables_to_lag
+    env_lagged_terms_ns = unlist(lapply(env_variables_to_lag_ns, function(var) {
+      paste0(var, "_L", 1:env_lag)
+      }))
+    
+    # Create the formula string
+    ar_mixed_formula_str_ns = paste(pure_ar_formula_str_ns, "+", paste(env_lagged_terms_ns, collapse = " + "),"+", paste(other_disease_lagged_terms_ns, collapse = " + "))
+    print(paste0("GLM-GAMSEL:", ar_mixed_formula_str_ns))
+    
+    glm_training_set = train_standardised %>%
+      dplyr::select(which(str_detect(names(.), outcome_var))) %>% 
+      dplyr::select(-c(outcome_var)) # Used to generate residuals from training set
+    # return(pure_ar_formula_str_ns)
+    glm_model = glm(as.formula(pure_ar_formula_str_ns), family = gaussian(), data = train_standardised)
+    glm_train_pred = predict(glm_model, newdata = glm_training_set, type = "response")
+    glm_residuals = train_standardised[[outcome_var]] - glm_train_pred
+    glm_pred = predict(glm_model, newdata = test_standardised, type = "response") # Making predictions for test set in first step
+    print("GLM Done")
+    
+    # Removal of population offset (different outcome variable; no need offset) and Creation of Pseudo Bases for Variables
+    gamsel_training = train_standardised %>% dplyr::select(-c(outcome_var))
+    
+    unique_vals = sapply(gamsel_training, function(col) length(unique(col)))
+    degrees = sapply(unique_vals, function(u) if (u <= 2) 1 else min(u - 1, 8))
+    dfs = pmin(degrees, unique_vals - 1)
+    a_bases = pseudo.bases(gamsel_training, degree = degrees, df = dfs)
+    
+    # Stage 2: Training GAMSEL
+    
+    # Conversion of formatting for GAMSEL and finding optimal values
+    train_matrix = as.matrix(train_standardised %>% dplyr::select(-c(outcome_var)))
+    new_outcome = as.matrix(glm_residuals)
+    gaussian_gamsel = gamsel(train_matrix, new_outcome, bases=a_bases)
+    optimal_lambda = which.max(gaussian_gamsel$dev.ratio)
+    
+    # Model 4: Make predictions on the test set
+    testing_set_gamsel = test_standardised
+    residual_pred = predict(gaussian_gamsel, newdata = testing_set_gamsel, type="response")[optimal_lambda]
+    if (abs(residual_pred) > 50){ 
+      residual_pred = 0
+    }
+    glm_gamsel_predictions = glm_pred + residual_pred
+    
+    print(glm_gamsel_predictions)
+    print("GLM-GAMSEL Done")
+    
+    # Model 5: 2-step forecasting: GAM-XGBoost
+    
+    # Generation of formula for GAM Model
+    training_set = train_standardised %>% dplyr::select(-c(outcome_var))
+    
+    gam_model = bam(as.formula(ar_mixed_formula_str), family = gaussian(), data = train_standardised)
+    # Predict on the test set
+    gam_pred = predict(gam_model, newdata = test_standardised, type = "response")
+    
+    # Generation of Residuals
+    gam_train_pred = predict(gam_model, newdata = training_set, type = "response")
+    err = abs(train_standardised[[outcome_var]] - gam_train_pred)/train_standardised[[outcome_var]]
+    gam_residuals = train_standardised[[outcome_var]] - gam_train_pred
+    train_set_xgboost = train_standardised %>% mutate(gam_residuals = gam_residuals)
+    
+    xgboost_formula = as.formula(paste0("gam_residuals ~ ", paste(pure_ar_lagged_terms_ns, collapse = " + ")," + ", paste(env_lagged_terms_ns, collapse = " + ")," + ", paste(other_disease_lagged_terms_ns, collapse = " + ")))
+    xgboost_formula_test = as.formula(paste0("~", paste(pure_ar_lagged_terms_ns, collapse = " + ")," + ", paste(env_lagged_terms_ns, collapse = " + ")," + ", paste(other_disease_lagged_terms_ns, collapse = " + ")))
+    
+    train_matrix = model.matrix(xgboost_formula, data = train_set_xgboost)[, -1]
+    test_matrix = model.matrix(xgboost_formula_test, data = test_standardised)[, -1]
+    print(paste0("XGB:", xgboost_formula))
+    print(paste0("XGB Test:", xgboost_formula_test))
+    if (nrow(as.data.frame(t(test_matrix)))==1){
+      test_matrix = as.matrix(t(test_matrix))
+    } else{
+      test_matrix = as.matrix(test_matrix)
+    }
+    
+    # Target variable for training
+    y_train = train_set_xgboost$gam_residuals
+    train_matrix = as.matrix(train_matrix)
+    
+    # Train the XGBoost model
+    xgb_train = xgb.DMatrix(data = train_matrix, label = y_train)
+    
+    xgb_model = xgboost(
+      data = xgb_train,
+      objective = "reg:squarederror",  # Regression objective
+      nrounds = 100,  # Number of boosting rounds (can tune this)
+      max_depth = 6,  # Maximum tree depth
+      eta = 0.1,  # Learning rate
+      subsample = 0.8,  # Subsample ratio of the training instances
+      colsample_bytree = 0.8,  # Subsample ratio of columns
+      verbosity = 0  # Suppress output
+    )
+    
+    # Make predictions on the test set
+    residual_pred = predict(xgb_model, newdata = xgb.DMatrix(data = test_matrix))
+    
+    # Model 5: Generation of combined prediction
+    gam_xgboost_predictions = gam_pred + residual_pred
+    
+    print("GAM-XGBoost Done")
+    
+    # Model 6: AutoML
+    
+    train_standardised_automl = train_standardised
+    test_standardised_automl = standardize_data(train_set,test_set,outcome = outcome_var)[[2]]
+    
+    h2o.init()
+    train_set = as.h2o(train_standardised_automl)
+    
+    aml_test_set = as.h2o(test_standardised_automl)
+
+    predictors = setdiff(names(train_standardised_automl), c(outcome_var))
+    response = outcome_var
+
+    # Train Deep Learning Model
+    aml = h2o.deeplearning(
+      x = predictors, y = response,
+      training_frame = train_set,
+      seed = 123
+    )
+    
+    aml_prediction = as.data.frame(h2o.predict(aml, newdata = aml_test_set))[1,]
+    actual_value = as.data.frame(aml_test_set[[response]])[1,]
+    
+    result_row = data.frame(
+      actual = test_set[[outcome_var]],
+      ar_mixed_predictions = ar_mixed_predictions,
+      gam_lss_predictions = gam_lss_predictions,
+      glm_gamsel_predictions = glm_gamsel_predictions,
+      gam_xgboost_predictions = gam_xgboost_predictions,
+      aml_prediction = aml_prediction)
+    message(paste("Completed iteration:", i))
+    return(result_row)
+  }
+  return(results)
+}
+```
+
+Finally, running of the code then commences for the overall admission rates for COPD and Asthma in hospitals.
+```{r}
+for (horizon in 1:12){
+  gc()
+  print(paste("Starting admission_rate_exog_copd horizon",horizon))
+  submodels_copd = regression_model_fn_exog(df_link = "combined_asthma_env_080225_norates.csv",outcome_var = "overall_rate_copd",horizon=horizon,significant_predictors = copd_discharge_significant_predictors)
+  copd_file_str = paste0("admission_rate_copd",horizon,"_exog_050325.rdata")
+  save(submodels_copd, file = copd_file_str)
+  print(paste("horizon",horizon,"for admission_rate_copd_exog done"))
+}
+
+for (horizon in 1:12){
+  gc()
+  print(paste("Starting admission_rate_exog_asthma horizon",horizon))
+  submodels_asthma = regression_model_fn_exog(df_link = "combined_asthma_env_080225_norates.csv",outcome_var = "overall_rate_asthma",horizon=horizon,significant_predictors = asthma_discharge_significant_predictors)
+  asthma_file_str = paste0("admission_rate_asthma",horizon,"_exog_050325.rdata")
+  save(submodels_asthma, file = asthma_file_str)
+  print(paste("horizon",horizon,"for admission_rate_asthma_exog done"))
+}
+```

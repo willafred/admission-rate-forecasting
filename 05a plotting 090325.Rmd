@@ -1,0 +1,837 @@
+---
+title: "05a plotting"
+output: 
+  pdf_document:
+    dev: cairo_pdf
+date: "2024-12-15"
+---
+# Description of File
+In this coding file, the code to generate each graph will be shown for Analysis 1, which refers to the multi-step forecasting of COPD and asthma admission rates, and the subgroup admission rates for both diseases as well.
+
+Therefore the file contains the following code:
+(1) Code to generate plots in the paper
+(2) Code to compare forecasting performances between models
+
+# Loading the relevant packages
+```{r setup, include=FALSE}
+rm(list=ls())
+library(ggplot2)
+library(tidyverse)
+library(gridExtra)
+library(lubridate)
+library(cowplot)
+
+asthma_variables = c("cases","female", "male", "age_15_to_39", "age_40_to_54", "age_55_to_64", "age_65_to_74", "age_75_to_84", "age_85_above")
+copd_variables = c("cases", "female", "male", "age_55_to_64", "age_65_to_74", "age_75_to_84", "age_85_above")
+
+for (var in copd_variables){
+  file_name = paste0("copd_",var,"_all_280225.rdata")
+  load(file_name)
+}
+
+for (var in asthma_variables){
+  file_name = paste0("asthma_",var,"_all_280225.rdata")
+  load(file_name)
+}
+```
+
+## Plot 1: Explanation of Cases against Time 
+- Main Text Figure 1
+```{r}
+
+var_df = function(df_link, var){
+  df = read_csv(df_link)%>%
+  column_to_rownames(var = "...1")
+  colnames(df) = gsub(" \\(C\\)", "", colnames(df))
+  colnames(df) = gsub(" \\(mm\\)", "", colnames(df))
+  colnames(df) = gsub(" \\(kmh\\)", "", colnames(df))
+  colnames(df) = gsub(" ", "_", colnames(df))
+  final_df = df %>% dplyr::select(year, week, var)
+  return(final_df)
+}
+
+asthma_df = var_df("combined_asthma_env_080225_norates.csv", "cases_asthma")
+copd_df = var_df("combined_asthma_env_080225_norates.csv", "cases_copd")
+
+plotter = function(df, disease, var){
+  
+  df$datetime = as.Date(paste0(df$year, "-W", sprintf("%02d", df$week), "-1"), format = "%Y-W%U-%u")
+  shade_start = as.Date("2020-01-01")
+  shade_end = as.Date("2022-12-31")
+  
+  start_date = min(df$datetime)
+  midpoint_date = df$datetime[floor(nrow(df) / 2)]
+  end_date = max(df$datetime)
+  
+  # Define shading data
+  shading = data.frame(
+    xmin = c(start_date, as.Date("2020-01-01")),
+    xmax = c(as.Date("2020-01-01"), shade_end),
+    ymin = -Inf,
+    ymax = Inf,
+    group = c("Training Set", "Structural Break")  # Add labels for the legend
+  )
+  
+  shading_after_midpoint = data.frame(
+    xmin = midpoint_date,
+    xmax = max(df$datetime),
+    ymin = -Inf,
+    ymax = Inf,
+    group = "Test Set"  # Add label for the legend
+  )
+  
+  all_shading = rbind(shading, shading_after_midpoint)
+  
+  final_plot = ggplot(df, aes(x = datetime, y = !!sym(var))) +
+    geom_rect(data = all_shading, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = group),
+              alpha = 0.3, inherit.aes = FALSE) +
+    geom_line(aes(color = "Observed"), size = 1) +  
+    scale_y_continuous(limits = c(0, max(df[[var]]) + 13)) +
+    scale_color_manual(
+        values = c("Observed" = "black", "Raw Cases" = "maroon")
+    ) +
+    guides(fill = "none") +
+    scale_fill_manual(values = c("Structural Break" = "red", "Test Set" = "lightgreen", "Training Set" = "lightblue")) +
+    annotate("segment", x = start_date, xend = midpoint_date, 
+             y = max(df[[var]]) + 6, yend = max(df[[var]]) + 6,
+             arrow = arrow(length = unit(0.2, "cm"), ends = "both"), color = "black") +
+    annotate("text", x = mean(c(start_date, midpoint_date)), 
+             y = max(df[[var]]) + 7, 
+             label = "Initial Training Set", hjust = 0.5, size = 10) +
+    annotate("segment", x = midpoint_date, xend = as.Date("2023-12-31"), 
+             y = max(df[[var]]) + 6, yend = max(df[[var]]) + 6,
+             arrow = arrow(length = unit(0.2, "cm"), ends = "both"), color = "black") +
+    annotate("text", x = mean(c(midpoint_date, as.Date("2023-12-31"))), 
+             y = max(df[[var]]) + 7, 
+             label = "Test Set 2 (With Structural Break)", hjust = 0.5, size = 10) +
+    annotate("text", x = mean(c(shading$xmin[2], shade_end)), 
+             y = max(df[[var]]) + 10, 
+             label = "Structural Break", hjust = 0.5, size = 10, fontface = "bold") +
+    annotate("segment", x = shading$xmin[2], xend = shade_end, 
+             y = max(df[[var]]) + 9, yend = max(df[[var]]) + 9,
+             arrow = arrow(length = unit(0.2, "cm"), ends = "both"), color = "black") +
+    annotate("segment", x = shading_after_midpoint$xmin[1], xend = shading$xmin[2], 
+             y = max(df[[var]]) + 2, yend = max(df[[var]]) + 2,
+             arrow = arrow(length = unit(0.2, "cm"), ends = "both"), color = "black") +
+    annotate("text", x = mean(c(shading_after_midpoint$xmin[1], shading$xmin[2])), 
+             y = max(df[[var]]) + 4.25, 
+             label = "Test Set 1", hjust = 0.5, size = 10) +
+    annotate("text", x = mean(c(shading_after_midpoint$xmin[1], shading$xmin[2])), 
+             y = max(df[[var]]) + 3, 
+             label = "(No Structural Break)", hjust = 0.5, size = 10) +
+    scale_x_date(date_breaks = "1 year", date_labels = "%Y", limits = as.Date(c("2012-01-01", "2023-12-31"))) +
+    labs(
+         x = "Year",
+         y = "Cases",
+         fill = "Period",
+         color = NULL) +  # Remove title
+    theme_minimal() +
+    theme(
+      axis.ticks = element_line(),  # Add axis ticks
+      axis.ticks.length = unit(0.2, "cm"),
+      plot.title = element_text(hjust = 0.5, size = 30),
+      legend.position = c(0.1, 1),  # Top-left corner
+      legend.justification = c(0, 1),
+      panel.grid = element_blank(),
+      # panel.background = element_rect(fill = "lightblue"),
+      legend.box.background = element_rect(color = "black", fill = "white", size = 0.5),
+      # legend.background = element_rect(fill = "white", color = NA),
+      axis.title.y = element_text(face = "bold", size = 30),
+      axis.title.x = element_text(face = "bold", size = 30),
+      panel.border = element_rect(color = "black", fill = NA, size = 1),
+      strip.text = element_text(size = 30),
+      axis.text = element_text(size = 30),
+      # legend.title = element_text(face = "bold", size=30),
+      legend.text = element_text(size=30)
+      
+    )
+  return(final_plot)
+}
+copd_admission = plotter(copd_df, "COPD", "cases_copd")
+asthma_admission = plotter(asthma_df, "Asthma", "cases_asthma")
+overall = plot_grid(
+  copd_admission, asthma_admission,
+  labels = "AUTO", ncol = 1, label_size = 50
+)
+ggsave(file="combined.pdf", plot=overall, width=20, height=25, limitsize=FALSE)
+```
+
+## Plot 2: PACF Plots
+Main Text Figure 2: Plotting optimum PACF for each disease
+- Same code as in 02 eda file
+```{r}
+combined_df = read_csv("combined_asthma_env_080225_norates.csv")%>%
+  column_to_rownames(var = "...1")
+colnames(combined_df) = gsub(" \\(C\\)", "", colnames(combined_df))
+colnames(combined_df) = gsub(" \\(mm\\)", "", colnames(combined_df))
+colnames(combined_df) = gsub(" \\(kmh\\)", "", colnames(combined_df))
+colnames(combined_df) = gsub(" ", "_", colnames(combined_df))
+
+combined_df_edited = combined_df
+
+rownames_split = as.numeric(rownames(combined_df_edited)) 
+
+years = floor(rownames_split / 100) 
+weeks = rownames_split %% 100  
+
+start_year = years[1]
+start_week = weeks[1]
+
+# Generating time series data
+ts_data = ts(combined_df_edited$cases_copd, start = c(start_year, start_week), frequency = 52)
+ts_data_asthma = ts(combined_df_edited$cases_asthma, start = c(start_year, start_week), frequency = 52)
+
+pacf_plotter = function(df, var){
+  pacf_values = acf(df[[var]], type = "partial", plot = FALSE)
+  pacf_df = data.frame(
+    Lag = as.vector(pacf_values$lag),
+    PACF = as.vector(pacf_values$acf)
+  )
+  
+  rownames_split = as.numeric(rownames(df))
+  years = floor(rownames_split / 100) 
+  weeks = rownames_split %% 100  
+  
+  start_year = years[1]
+  start_week = weeks[1]
+  
+  ts_data = ts(df[[var]], start = c(start_year, start_week), frequency = 52)
+  lag_val = 0
+  for (lag_num in 1:20){
+    lag_val = lag_val + 1
+    pstat = Box.test(residuals(arima(ts_data,order=c(lag_num,0,0))), lag = 3, type = "Ljung-Box")$p.value
+    # return(pstat)
+    if (pstat > 0.01){
+      final_pvalue = pstat
+      break
+    } else {
+      next
+    }
+  }
+  
+  pacf_df = pacf_df %>% mutate(Shades = ifelse(Lag <= lag_val, "Used Lag", "Unused Lag"))
+  
+  final_plot = ggplot(pacf_df, aes(x = Lag, y = PACF, fill = Shades)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Lags",
+         y = "Partial Autocorrelation") +
+    scale_y_continuous(limits=c(-0.1,0.5)) +
+    theme_minimal() +
+    theme(
+      axis.ticks = element_line(),  # Add axis ticks
+      axis.ticks.length = unit(1, "cm"),
+      plot.title = element_text(hjust = 0.5, size = 30),
+      legend.position = c(0.65, 1),  # Top-left corner
+      legend.justification = c(0, 1),
+      panel.grid = element_blank(),
+      # panel.background = element_rect(fill = "lightblue"),
+      legend.box.background = element_rect(color = "black", fill = "white", size = 0.5),
+      # legend.background = element_rect(fill = "white", color = NA),
+      axis.title.y = element_text(face = "bold", size = 50),
+      axis.title.x = element_text(face = "bold", size = 50),
+      panel.border = element_rect(color = "black", fill = NA, size = 1),
+      strip.text = element_text(size = 50),
+      axis.text = element_text(size = 50),
+      legend.title = element_text(face = "bold", size=50),
+      legend.text = element_text(size=50)
+    )
+  return(final_plot)
+}
+
+new_combined = combined_df_edited[1:floor(0.5*nrow(combined_df_edited)),]
+
+x = pacf_plotter(new_combined, "cases_copd") + theme(legend.position = "none")+
+  scale_y_continuous(breaks = waiver(),limits=c(-0.1,0.5)) +  # Add ticks on the y-axis
+  theme(axis.text.x = element_blank(),     # Remove x-axis labels
+        axis.ticks.x = element_blank()) + 
+  labs(x = NULL)
+
+legend = get_legend(
+    pacf_plotter(new_combined, "cases_copd") +
+      theme(legend.position = "right",
+            legend.justification = c(0.3, 0.5),
+            legend.box.margin = margin(0, 0, 0, -2),
+            legend.title = element_text(size = 50, face = "bold"),
+            legend.text = element_text(size = 45))
+  )
+
+y = pacf_plotter(new_combined, "cases_asthma")+ theme(legend.position = "none")
+
+overall = plot_grid(plot_grid(x, y,labels = "AUTO", ncol = 1, label_size = 70,hjust = 0.05,vjust=1),
+                            legend,
+                            ncol = 2, 
+                            rel_widths = c(6, 1))
+
+ggsave(file="combined_pacf_280225.pdf", plot=overall, width=30, height=22.5, limitsize=FALSE)
+```
+
+## Plot 3: MAPE plotter
+The code chunk below describes the generation of Main Text Figure 3 (COPD) and 4 (Asthma) which show the MAPE performance of forecasting models for raw admission cases and admission rates for subgroups for both diseases. 
+
+It is to note that only MAPE is plotted. MAE and MASE will be included in data tables in Supplementary Information.
+
+```{r}
+mape_df_generator = function(df, structural_break){
+  if (structural_break == T){
+    df_long = df %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_env_predictions" = "AR (C)",
+                            "ar_mixed_predictions" = "AR (D)",
+                            "ar_other_disease_predictions" = "AR (B)",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "med_weights_predictions" = "MF",
+                            "naive_predictions" = "Naive",
+                            "pure_ar_predictions" = "AR (A)",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon)%>%
+      filter(actual != 0) %>%
+      summarise(mape = 100*mean(abs(actual - pred) / actual,na.rm=T),.groups="drop")
+    return(df_long)
+  } else {
+    df_long = df %>%
+      group_by(horizon) %>%
+      slice_head(prop = 0.3) %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_env_predictions" = "AR (C)",
+                            "ar_mixed_predictions" = "AR (D)",
+                            "ar_other_disease_predictions" = "AR (B)",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "med_weights_predictions" = "MF",
+                            "naive_predictions" = "Naive",
+                            "pure_ar_predictions" = "AR (A)",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon)%>%
+      filter(actual != 0) %>%
+      summarise(mape = 100*mean(abs(actual - pred) / actual,na.rm=T),.groups="drop")
+    return(df_long)
+  }
+}
+
+model_group_num = c(
+  "MLP" = "Unrestricted Models",
+  "AR (C)" = "Simple Models",
+  "AR (D)" = "Simple Models",
+  "AR (B)" = "Simple Models",
+  "BG1" = "Forecast Combinations",
+  "BG2" = "Forecast Combinations",
+  "SA" = "Forecast Combinations",
+  "GAMLSS" = "Unrestricted Models",
+  "GAM-XGBoost" = "Two-Step Forecasting Models",
+  "GLM-GAMSEL" = "Two-Step Forecasting Models",
+  "MF" = "Forecast Combinations",
+  "Naive" = "Simple Models",
+  "AR (A)" = "Simple Models",
+  "TM" = "Forecast Combinations"
+)
+
+var_name_mapping = c(
+  "age_0_to_14" = "Ages 0 to 14",
+  "age_15_to_39" = "Ages 15 to 39",
+  "age_40_to_54" = "Ages 40 to 54",
+  "age_55_to_64" = "Ages 55 to 64",
+  "age_65_to_74" = "Ages 65 to 74",
+  "age_75_to_84" = "Ages 75 to 84",
+  "age_85_above" = "85 and above",
+  "cases" = "Admission Cases",
+  "female" = "Female",
+  "male" = "Male"
+)
+
+shapes_list = seq(5,19)
+mape_plotter = function(df, structural_break = T, title_name, dis){
+  
+  if (structural_break == T){
+    structural_break_bin = "With Structural Break"
+  } else {
+    structural_break_bin = "Without Structural Break"
+  }
+  df_long = mape_df_generator(df, structural_break)
+  combined_plot_mape = df_long %>% mutate(model_grp = model_group_num[model])
+  
+  unique_groups = unique(combined_plot_mape$model)
+  
+  shape_mapping = setNames(shapes_list[seq_along(unique_groups)], unique_groups)
+  
+  final_plot = ggplot(combined_plot_mape, aes(x = horizon, y = mape, color = model_grp, shape = model)) +
+    geom_line(size = 3) +
+    geom_point(size = 15, stroke = 3) +
+    labs(
+      title = paste(title_name),
+      x = "Horizon", y = paste0("MAPE (", dis,", %)"), color = "Model Type", shape = "Model") +
+    scale_shape_manual(values = shape_mapping) +
+    scale_x_continuous(breaks = 1:12, limits = c(1, 12)) +
+    scale_y_continuous(breaks = seq(0,100,by = 20), limits = c(0, 100)) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 75, face = "bold"),
+      legend.position = "right",
+      panel.grid = element_blank(),
+      # legend.box.background = element_rect(color = "black", size = 2),
+      axis.title.y = element_text(face = "bold",size=75),
+      axis.title.x = element_text(face="bold",size=75),
+      panel.border = element_rect(color = "black", fill = NA, size = 1),
+      legend.title = element_text(face = "bold", size = 75),
+      legend.text = element_text(size=75),
+      strip.text = element_text(size = 75),
+      axis.text = element_text(size = 75),
+      legend.key.size = unit(2, "lines")
+      )
+  return(final_plot)
+}
+
+combined_plotter = function(disease, disease_var){
+  all_plots_sb = list()
+  if (disease == "asthma"){
+    cap_disease = "Asthma"
+    bot_margin = 20
+  } else{
+    cap_disease = "COPD"
+    bot_margin = 20
+  }
+  
+  legend = get_legend(mape_plotter(asthma_age_15_to_39_all_280225, structural_break = T, title_name = "",dis=cap_disease))
+
+  for (i in seq_along(disease_var)){
+    var = disease_var[i]
+    df = get(paste0(disease, "_", var, "_all_280225"))
+    var_name = paste0("A", i, ": ", var_name_mapping[[var]])
+    plot = mape_plotter(df, structural_break = T, title_name = var_name,dis=cap_disease) + theme(legend.position = "none")
+    if (i %% 2 != 0) {
+      if (i != 1){
+        plot = plot + theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+      }
+    }
+    if (i <= length(disease_var) - 2) {
+      if (i != 1){
+        plot = plot + theme(axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank())
+      }
+    }
+    plot = plot + theme(plot.margin = margin(t = 50, r = 0, b = 0, l = 0))
+    all_plots_sb[[var_name]] = plot
+  }
+  
+  all_plots_nsb = list()
+  for (i in seq_along(disease_var)){
+    var = disease_var[i]
+    df = get(paste0(disease, "_", var, "_all_280225"))
+    var_name = paste0("B", i, ": ", var_name_mapping[[var]])
+    plot = mape_plotter(df, structural_break = F, title_name = var_name,dis=cap_disease) + theme(legend.position = "none") + theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+    
+    if (i <= length(disease_var) - 2) {
+      if (i != 1){
+        plot = plot + theme(axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank())
+      }
+    }
+    plot = plot + theme(plot.margin = margin(t = 50, r = 0, b = 0, l = 0))
+    all_plots_nsb[[var_name]] = plot
+  }
+  
+  all_plots_sb_admission = all_plots_sb[[1]]
+  all_plots_sb_subgroups = all_plots_sb[-1]
+  
+  all_plots_nsb_admission = all_plots_nsb[[1]]
+  all_plots_nsb_subgroups = all_plots_nsb[-1]
+  
+  dashed_line = ggplot() + 
+    geom_segment(aes(x = 0, xend = 0, y = -5, yend = 5), 
+                 linetype = "dashed", size = 10, color = "black") +
+    theme_void() + 
+    theme(plot.margin = margin(0, 0, 0, 0, "cm"))
+  
+  final_plot = plot_grid(
+    plot_grid(plot_grid(all_plots_sb_admission, 
+                        plot_grid(plotlist = all_plots_sb_subgroups, ncol = 2, rel_widths = c(1.1,1)),
+                        nrow=2,
+                        rel_heights = c(1,4)),
+              dashed_line,
+              plot_grid(all_plots_nsb_admission, 
+                        plot_grid(plotlist = all_plots_nsb_subgroups, ncol = 2),
+                        nrow=2,
+                        rel_heights = c(1,4)),
+              ncol = 3, rel_widths = c(1.05, 0.05, 1)),
+    legend,
+    ncol = 2, rel_widths = c(4.5, 1)
+  )
+  
+  return(final_plot)
+}
+
+asthma_mape = combined_plotter("asthma", asthma_variables)
+ggsave(file="asthma_mape.pdf", plot=asthma_mape, width=90, height=85, limitsize=FALSE)
+
+copd_mape = combined_plotter("copd", copd_variables)
+ggsave(file="copd_mape.pdf", plot=copd_mape, width=90, height=65, limitsize=FALSE)
+
+```
+
+# Part 2: Comparison of Models through computation of Wald's Test
+- The chunk below describes the function to compare the statistical significance of the differences in performance between models by comparing the models pair by pair, for all possible combinations at 95% significance level.
+
+```{r}
+
+calculate_proportions = function(df, significance_level = 0.05,horizon_num,structural_break=T) {
+  final_df = data.frame(matrix(ncol = 3, nrow = 0))
+  colnames(final_df) = c("Model 1", "Model 2", "Outcome")
+  if (structural_break == T){
+    df_long = df %>%
+        filter(horizon == horizon_num) %>%
+        ungroup() %>%
+        dplyr::select(actual, ends_with("predictions")) %>%
+        mutate(time = row_number()) %>%
+        pivot_longer(
+          cols = -c(time,actual), 
+          names_to = "model", 
+          values_to = "pred") %>%
+        mutate(model = recode(model,
+                              "aml_predictions" = "MLP",
+                              "ar_env_predictions" = "AR (C)",
+                              "ar_mixed_predictions" = "AR (D)",
+                              "ar_other_disease_predictions" = "AR (B)",
+                              "bg1_predictions" = "BG1",
+                              "bg2_predictions" = "BG2",
+                              "eq_weights_predictions" = "SA",
+                              "gam_lss_predictions" = "GAMLSS",
+                              "gam_xgboost_predictions" = "GAM-XGBoost",
+                              "glm_gamsel_predictions" = "GLM-GAMSEL",
+                              "med_weights_predictions" = "MF",
+                              "naive_predictions" = "Naive",
+                              "pure_ar_predictions" = "AR (A)",
+                              "trimmed_mean_predictions" = "TM"
+                              )) %>%
+        mutate(pred = ifelse(pred<0,0,pred),
+               err = abs(pred-actual))
+  } else {
+    df_long = df %>%
+        filter(horizon == horizon_num) %>%
+        ungroup() %>%
+        slice_head(prop = 0.3) %>%
+        dplyr::select(actual, ends_with("predictions")) %>%
+        mutate(time = row_number()) %>%
+        pivot_longer(
+          cols = -c(time,actual), 
+          names_to = "model", 
+          values_to = "pred") %>%
+        mutate(model = recode(model,
+                              "aml_predictions" = "MLP",
+                              "ar_env_predictions" = "AR (C)",
+                              "ar_mixed_predictions" = "AR (D)",
+                              "ar_other_disease_predictions" = "AR (B)",
+                              "bg1_predictions" = "BG1",
+                              "bg2_predictions" = "BG2",
+                              "eq_weights_predictions" = "SA",
+                              "gam_lss_predictions" = "GAMLSS",
+                              "gam_xgboost_predictions" = "GAM-XGBoost",
+                              "glm_gamsel_predictions" = "GLM-GAMSEL",
+                              "med_weights_predictions" = "MF",
+                              "naive_predictions" = "Naive",
+                              "pure_ar_predictions" = "AR (A)",
+                              "trimmed_mean_predictions" = "TM"
+                              )) %>%
+        mutate(pred = ifelse(pred<0,0,pred),
+               err = abs(pred-actual))
+  }
+  
+  model_names = unique(df_long$model)
+  model_names_sorted = sort(model_names)
+  pairs_matrix = combn(model_names_sorted, 2, simplify = TRUE)
+  
+  # Initialize a vector to store counts of how many times each model performs better
+  better_count = setNames(rep(0, length(model_names_sorted)), model_names_sorted)
+  total_comparisons = setNames(rep(0, length(model_names_sorted)), model_names_sorted)
+  
+  # Loop over all pairs and compute Wald statistic
+  for (i in 1:ncol(pairs_matrix)) {
+    model1 = pairs_matrix[1, i]
+    # return(model1)
+    model2 = pairs_matrix[2, i]
+    # return(model2)
+    
+    compute_wald_one_sided = function(errors1, errors2) {
+      mean_diff = mean(errors1 - errors2)
+      var_diff = var(errors1 - errors2) / length(errors1)
+      wald_stat = (mean_diff^2) / var_diff
+      return(as.numeric(wald_stat))
+    }
+
+    model1_err = df_long %>% 
+      filter(model == model1) %>%
+      pull(err)
+    
+    model2_err = df_long %>%
+      filter(model == model2) %>%
+      pull(err)
+    # Compute Wald statistic
+    wald_stat = compute_wald_one_sided(model1_err,model2_err)
+    # Chi-squared critical value (df = 1 for one-sided comparison)
+    critical_value = qchisq(1 - significance_level, df = 1)
+
+    if (wald_stat > critical_value) { # Means there is statistically significant difference in forecast accuracy
+      if (mean(model1_err) < mean(model2_err)){
+        better_count[model1] = better_count[model1] + 1
+        outcome = "Model 1"
+        print(paste(model1, "is better than",model2))
+      } else {
+        better_count[model2] = better_count[model2] + 1
+        outcome = "Model 2"
+        print(paste(model1,  "is worse than",model2))
+      }
+    } else {
+      better_count[model2] = better_count[model2] + 1
+      outcome = "Equivalent"
+      print(paste("Both", model1, "and", model2, "are equivalent"))
+    }
+    new_row = data.frame(`Model 1` = model1, 
+                      `Model 2` = model2, 
+                      Outcome = outcome)
+    final_df = rbind(final_df, new_row)
+    # Count the total number of comparisons for each model
+    total_comparisons[model1] = total_comparisons[model1] + 1
+    total_comparisons[model2] = total_comparisons[model2] + 1
+  }
+  
+  # Calculate the proportion of times each model performs better
+  proportion_better = better_count / total_comparisons
+  return(final_df)
+}
+
+```
+
+
+The chunk below describes the function to plot the statistical significance of the difference in forecasting performance of the models. There are the plots generated:
+
+(1) Main Text Plot - This plot only contains 4 horizons for ease of reference in the paper
+
+```{r}
+
+relative_perf_plotter = function(df, horizon_num, structural_break = T, si = T){
+  if (structural_break == T){
+    struc_bin = "With Structural Break"
+  } else {
+    struc_bin = "Without Structural Break"
+  }
+  proportions_df = calculate_proportions(df,horizon_num = horizon_num, structural_break = structural_break)
+  proportions_df$Model.1 = factor(proportions_df$Model.1, levels = unique(proportions_df$Model.1))
+  proportions_df$Model.2 = factor(proportions_df$Model.2, levels = rev(unique(proportions_df$Model.2)))
+  if (si == T){
+    shape_size = 44
+    text_size = 75
+  } else {
+    shape_size = 35
+    text_size = 72
+  }
+  final_plot = ggplot() +
+    geom_point(data = proportions_df, aes(x = Model.1, y = Model.2, color = Outcome, fill = Outcome, alpha = Outcome), shape = 22, size = shape_size) +
+    theme_minimal() +
+    scale_alpha_manual(values = c(0.2, 0.7, 0.7), 
+                       labels = c("Equivalent", "Model 1", "Model 2")) +
+    labs(title = paste("Comparison of Models", struc_bin),
+         x = "Model 1",
+         y = "Model 2",
+         color = "Better Performing Model",
+         fill = "Better Performing Model",
+         alpha = "Better Performing Model") +
+    theme(plot.title = element_text(hjust = 0.5, size = text_size),
+          panel.grid = element_blank(),
+          legend.position = c(1.1, 0.9), # Top-right position
+          legend.justification = c("right", "top"),
+          axis.title.y = element_text(face = "bold",size=text_size),
+          axis.title.x = element_text(face="bold",size=text_size-5),
+          legend.title = element_text(face = "bold", size = text_size),
+          legend.text = element_text(size=text_size),
+          strip.text = element_text(size = text_size),
+          axis.text = element_text(size = text_size),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = text_size-3),
+          legend.key.size = unit(2, "lines"),
+          aspect.ratio = 2/2
+          )
+  return(final_plot)
+}
+
+letters_si = c("A","B","C","D","E","F","G","H","I","J","K","L")
+letters_main_text = c("A","B","C","B","E","F","G","C","I","J","K","D")
+
+plot_horizons_without_legend_maintext = function(df, horizons, structural_break = T, first_row = F, last_row = F, row_lab) {
+  if (first_row == F && last_row == T){
+    plots = lapply(horizons, function(h) {
+      p = relative_perf_plotter(df, horizon_num = h, structural_break = structural_break, si = F) +
+        labs(title = paste0(row_lab, which(horizons == h),": ", h,"-week(s) ahead")) +
+        theme(
+          plot.title = element_text(face = "bold", size = 80),
+          # plot.title = element_blank(),
+              legend.position = "none",
+              axis.title.y = if (h == min(horizons)) element_text() else element_blank(),
+              axis.text.y = if (h == min(horizons)) element_text() else element_blank(),
+              axis.ticks.y = if (h == min(horizons)) element_line() else element_blank(),
+              plot.margin = unit(c(0.5, -2, 0, -4), "cm"))
+      return(p)
+    })
+  } else if (first_row == T && last_row == F){
+    plots = lapply(horizons, function(h) {
+      p = relative_perf_plotter(df, horizon_num = h, structural_break = structural_break, si = F) +
+        labs(title = paste0(row_lab, which(horizons == h),": ", h,"-week(s) ahead")) +
+        theme(
+              plot.title = element_text(face = "bold", size = 80),
+              legend.position = "none",
+              axis.text.x = element_blank(),     # Remove x-axis labels
+              axis.ticks.x = element_blank(),
+              axis.title.y = if (h == min(horizons)) element_text() else element_blank(),
+              axis.text.y = if (h == min(horizons)) element_text() else element_blank(),
+              axis.ticks.y = if (h == min(horizons)) element_line() else element_blank(),
+              plot.margin = unit(c(0.5, -2, 0, -4), "cm")) + 
+  labs(x = NULL)
+      return(p)
+    })
+  } else {
+    plots = lapply(horizons, function(h) {
+      p = relative_perf_plotter(df, horizon_num = h, structural_break = structural_break, si = F) +
+        labs(title = paste0(row_lab, which(horizons == h),": ", h,"-week(s) ahead")) +
+        theme(
+          plot.title = element_text(face = "bold", size = 80),
+              legend.position = "none",
+              axis.text.x = element_blank(),     # Remove x-axis labels
+              axis.ticks.x = element_blank(),
+              axis.title.x = element_blank(),
+              axis.title.y = if (h == min(horizons)) element_text() else element_blank(),
+              axis.text.y = if (h == min(horizons)) element_text() else element_blank(),
+              axis.ticks.y = if (h == min(horizons)) element_line() else element_blank(),
+              plot.margin = unit(c(0.5, -2, 0, -4), "cm")
+              )
+      return(p)
+    })
+  }
+  
+  final_plot = plot_grid(plotlist = plots, 
+                         # labels = plot_labels_new, 
+                         label_size = 80, label_x = 0.15,
+                         ncol = 4, nrow = 1, rel_widths = c(2,1.7,1.7,1.7))
+  return(final_plot)
+}
+
+legend_extractor = function(df, horizons, structural_break = T, si = T) {
+  if (si == T){
+    legend_size = 90
+  } else {
+    legend_size = 95
+  }
+  # Extract the legend from the first plot
+  legend = get_legend(
+    relative_perf_plotter(df, horizon_num = horizons[1], structural_break = structural_break) +
+      theme(legend.position = "right",
+            legend.justification = c(0.3, 0.5),  # Adjust to keep it centered vertically
+            legend.title = element_text(size = legend_size, face = "bold"),  # Adjust font size for legend title
+            legend.text = element_text(size = legend_size),
+            legend.box.background = element_rect(color = "black", size = 2),
+            legend.direction = "horizontal") # Ensure the legend is positioned correctly
+  )
+  
+  return(legend)
+}
+
+horizons_si = 1:12
+horizons_main_text = c(1,4,8,12)
+
+# Plotting of Main Text
+
+copd_with_struc_break = plot_horizons_without_legend_maintext(copd_cases_all_280225, horizons_main_text, structural_break = T, first_row = T, row_lab = "A")
+copd_without_struc_break = plot_horizons_without_legend_maintext(copd_cases_all_280225, horizons_main_text, structural_break = F, row_lab = "B")
+asthma_with_struc_break = plot_horizons_without_legend_maintext(asthma_cases_all_280225, horizons_main_text, structural_break = T, row_lab = "C")
+asthma_without_struc_break = plot_horizons_without_legend_maintext(asthma_cases_all_280225, horizons_main_text, structural_break = F, last_row = T, row_lab = "D")
+legend = legend_extractor(asthma_cases_all_280225, horizons_main_text, structural_break = F)
+maintext_plot = plot_grid(
+  copd_with_struc_break,
+  copd_without_struc_break,
+  asthma_with_struc_break,
+  asthma_without_struc_break,
+  legend, nrow = 5,
+  rel_heights = c(7,7,7,10.5,1)
+)
+
+ggsave(file="main_text_090325.pdf", plot=maintext_plot, width=90, height=65, limitsize=FALSE)
+
+# plot_all_horizons_without_legend_new = function(df, horizons, structural_break = T) {
+#   plots = lapply(horizons, function(h) {
+#     p = relative_perf_plotter(df, horizon_num = h, structural_break = structural_break) +
+#       labs(title = paste0(letters_si[h],": ", h,"-week(s) ahead")) +
+#       theme(plot.title = element_text(face = "bold", size = 80),
+#             legend.position = "none",
+#             axis.text.y = if (h %in% c(1, 4, 7, 10)) element_text() else element_blank(),
+#             axis.title.y = if (h %in% c(1, 4, 7, 10)) element_text() else element_blank(),
+#             axis.text.x = if (h %in% c(10, 11, 12)) element_text() else element_blank(),
+#             axis.title.x = if (h %in% c(10, 11, 12)) element_text() else element_blank(),
+#             plot.margin = margin(50,0,0,0))
+#     return(p)
+#   })
+#   final_plot = plot_grid(plotlist = plots, ncol = 3, nrow = 4, rel_widths = c(1.5,1,1), rel_heights = c(1,1,1,1.3))
+#   return(final_plot)
+# }
+# 
+# for (var in copd_variables){
+#   df = get(paste0("copd_", var, "_all_100125"))
+#   with_struc_break = plot_all_horizons_without_legend_new(df, horizons_si, structural_break = T)
+#   without_struc_break = plot_all_horizons_without_legend_new(df, horizons_si, structural_break = F)
+#   legend = legend_extractor(df, horizons_si, structural_break = F)
+#   
+#   file_name = paste0("copd_modelcomp_", var)
+#   overall_struc_break = plot_grid(with_struc_break,
+#     legend, nrow = 2,
+#     rel_heights = c(20,1)
+#   )
+#   
+#   overall_no_struc_break = plot_grid(without_struc_break,
+#     legend, nrow = 2,
+#     rel_heights = c(20,1)
+#   )
+#   
+#   file_name = paste0("copd_", var, "_modelcomp_")
+#   ggsave(file=paste0(file_name, "with_strucbreak_190125.pdf"), plot=overall_struc_break, width=65, height=90, limitsize=FALSE)
+#   ggsave(file=paste0(file_name, "no_strucbreak_190125.pdf"), plot=overall_no_struc_break, width=65, height=90, limitsize=FALSE)
+# }
+# 
+# for (var in asthma_variables){
+#   df = get(paste0("asthma_", var, "_all_100125"))
+#   with_struc_break = plot_all_horizons_without_legend_new(df, horizons_si, structural_break = T)
+#   without_struc_break = plot_all_horizons_without_legend_new(df, horizons_si, structural_break = F)
+#   legend = legend_extractor(df, horizons_si, structural_break = F)
+#   
+#   file_name = paste0("asthma_modelcomp_", var)
+#   overall_struc_break = plot_grid(with_struc_break,
+#                                   legend, nrow = 2,
+#                                   rel_heights = c(20,1)
+#   )
+#   
+#   overall_no_struc_break = plot_grid(without_struc_break,
+#                                      legend, nrow = 2,
+#                                      rel_heights = c(20,1)
+#   )
+#   
+#   file_name = paste0("asthma_", var, "_modelcomp_")
+#   ggsave(file=paste0(file_name, "with_strucbreak_190125.pdf"), plot=overall_struc_break, width=65, height=90, limitsize=FALSE)
+#   ggsave(file=paste0(file_name, "no_strucbreak_190125.pdf"), plot=overall_no_struc_break, width=65, height=90, limitsize=FALSE)
+# }
+```

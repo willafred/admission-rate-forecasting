@@ -1,0 +1,837 @@
+---
+title: "06a plotting"
+output: 
+  pdf_document:
+    dev: cairo_pdf
+date: "2024-12-15"
+---
+# Description of File
+
+In this coding file, the code to generate each table in Supplementary Information S1 will be shown.
+
+# Loading the relevant packages
+```{r setup, include=FALSE}
+rm(list=ls())
+library(ggplot2)
+library(tidyverse)
+library(gridExtra)
+library(lubridate)
+library(cowplot)
+
+asthma_variables = c("cases","female", "male", "age_15_to_39", "age_40_to_54", "age_55_to_64", "age_65_to_74", "age_75_to_84", "age_85_above")
+copd_variables = c("cases", "female", "male", "age_55_to_64", "age_65_to_74", "age_75_to_84", "age_85_above")
+analysis_2_factors = c("age", "gender", "exog", "noexog")
+
+for (var in copd_variables){
+  file_name = paste0("copd_",var,"_all_280225.rdata")
+  load(file_name)
+}
+
+for (var in asthma_variables){
+  file_name = paste0("asthma_",var,"_all_280225.rdata")
+  load(file_name)
+}
+
+for (var in analysis_2_factors){
+  file_name = paste0("asthma_",var,"_combined_all_090325.rdata")
+  load(file_name)
+  file_name = paste0("copd_",var,"_combined_all_090325.rdata")
+  load(file_name)
+}
+  file_name = paste0("copd_",var,"_combined_all_090325")
+```
+
+# General Functions
+- data_editing, naive_model, and naive_mean_generator are used for computation for MASE
+
+```{r}
+data_editing = function(df_filename, outcome){
+  combined_df = read_csv(df_filename)%>%
+  column_to_rownames(var = "...1")
+  
+  if (outcome == "cases_copd"){
+    popn = "residents_copd"
+  } else if (outcome == "cases_asthma"){
+    popn = "residents_asthma"
+  } else {
+    actual_outcome = sub("_([^_]+)$", "", outcome)
+    last_part = sub(".*_(.*)$", "\\1", outcome)
+    popn = colnames(combined_df)[str_detect(colnames(combined_df), paste0(actual_outcome,"_residents","_",last_part))]
+  }
+  new_combined = combined_df %>% 
+    dplyr::select(year, week, outcome, popn)
+  if (outcome == "male_asthma"|outcome=="male_copd"){
+    new_combined = new_combined %>% 
+      dplyr::select(-starts_with("female_residents"))
+  }
+  return(new_combined)
+}
+
+naive_model = function(df, horizon, outcome){
+  df[[outcome]] = dplyr::lag(df[[outcome]],n=horizon)
+  df = na.omit(df)
+  return(df)
+}
+
+naive_mean_generator = function(df_link = "combined_asthma_env_080225_norates.csv", outcome_var, training_limit=0.5){
+  df = data_editing(df_link, outcome_var)
+  training_length = floor(nrow(df)*training_limit)
+  naive_mae = function(df_use, horizon, outcome,training_len){
+    naive_x = naive_model(df_use,horizon,outcome = outcome)[[outcome]]
+    naive_y = df_use[(horizon+1):nrow(df_use),][[outcome_var]]
+    naive_pred = naive_x[2:(training_len+1)]
+    naive_actual = naive_y[2:(training_len+1)]
+    mean_abs_err = mean(abs(naive_pred-naive_actual))
+    return(mean_abs_err)
+  }
+
+  final_df = data.frame(horizon = numeric(), naive_mean = numeric(), stringsAsFactors = FALSE)
+  for (horizon_num in 1:12){
+    mae_horizon = naive_mae(df, horizon_num, outcome = outcome_var, training_len = training_length)
+    to_add = data.frame(horizon = horizon_num, naive_mean = mae_horizon)
+    final_df = rbind(final_df, to_add)
+  }
+  return(final_df)
+}
+```
+
+# Generation Functions to compute error metrics for MAPE, MAE and MASE
+- Each function has an argument of structural_break to determine if the evaluation period includes or excludes the structural break
+```{r}
+mape_df_generator = function(df, structural_break){
+  if (structural_break == T){
+    df_long = df %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_env_predictions" = "AR (C)",
+                            "ar_mixed_predictions" = "AR (D)",
+                            "ar_other_disease_predictions" = "AR (B)",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "med_weights_predictions" = "MF",
+                            "naive_predictions" = "Naive",
+                            "pure_ar_predictions" = "AR (A)",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon)%>%
+      filter(actual != 0) %>%
+      summarise(mape = 100*mean(abs(actual - pred) / actual,na.rm=T),.groups="drop")
+    return(df_long)
+  } else {
+    df_long = df %>%
+      group_by(horizon) %>%
+      slice_head(prop = 0.3) %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_env_predictions" = "AR (C)",
+                            "ar_mixed_predictions" = "AR (D)",
+                            "ar_other_disease_predictions" = "AR (B)",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "med_weights_predictions" = "MF",
+                            "naive_predictions" = "Naive",
+                            "pure_ar_predictions" = "AR (A)",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon)%>%
+      filter(actual != 0) %>%
+      summarise(mape = 100*mean(abs(actual - pred) / actual,na.rm=T),.groups="drop")
+    return(df_long)
+  }
+}
+
+mae_df_generator = function(df, with_structural_break){
+  if (with_structural_break == T){
+    df_long = df %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(pred = ifelse(pred<0,0,pred)) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_env_predictions" = "AR (C)",
+                            "ar_mixed_predictions" = "AR (D)",
+                            "ar_other_disease_predictions" = "AR (B)",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "med_weights_predictions" = "MF",
+                            "naive_predictions" = "Naive",
+                            "pure_ar_predictions" = "AR (A)",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon) %>%
+      summarise(mae = mean(abs(actual-pred)),.groups="drop")
+    return(df_long)
+    
+  } else {
+    df_long= df %>%
+      group_by(horizon) %>%
+      slice_head(prop = 0.3) %>%
+      ungroup() %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(pred = ifelse(pred<0,0,pred)) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_env_predictions" = "AR (C)",
+                            "ar_mixed_predictions" = "AR (D)",
+                            "ar_other_disease_predictions" = "AR (B)",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "med_weights_predictions" = "MF",
+                            "naive_predictions" = "Naive",
+                            "pure_ar_predictions" = "AR (A)",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon) %>%
+      summarise(mae = mean(abs(actual-pred)),.groups="drop")
+    return(df_long)
+  }
+}
+
+mase_df_generator = function(df, naive_mean_df, structural_break){
+  if (structural_break == T){
+    df_long = df %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_env_predictions" = "AR (C)",
+                            "ar_mixed_predictions" = "AR (D)",
+                            "ar_other_disease_predictions" = "AR (B)",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "med_weights_predictions" = "MF",
+                            "naive_predictions" = "Naive",
+                            "pure_ar_predictions" = "AR (A)",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon) %>%
+      left_join(naive_mean_df, by="horizon") %>%
+      summarise(mase = mean(abs(actual-pred))/naive_mean,.groups="drop") %>%
+      unique()
+    return(df_long)
+  } else {
+    df_long= df %>%
+      group_by(horizon) %>%
+      slice_head(prop = 0.3) %>%
+      ungroup() %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_env_predictions" = "AR (C)",
+                            "ar_mixed_predictions" = "AR (D)",
+                            "ar_other_disease_predictions" = "AR (B)",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "med_weights_predictions" = "MF",
+                            "naive_predictions" = "Naive",
+                            "pure_ar_predictions" = "AR (A)",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon) %>%
+      left_join(naive_mean_df, by="horizon") %>%
+      summarise(mase = mean(abs(actual-pred))/naive_mean,.groups="drop") %>%
+      unique()
+    return(df_long)
+  }
+}
+```
+
+The chunk below describes the same functions, but for Analysis 2
+```{r}
+mape_df_generator_analysis2 = function(df, structural_break){
+  if (structural_break == T){
+    df_long = df %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_predictions" = "AR",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "med_weights_predictions" = "MF",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon)%>%
+      filter(actual != 0) %>%
+      summarise(mape = 100*mean(abs(actual - pred) / actual,na.rm=T),.groups="drop")
+    return(df_long)
+  } else {
+    df_long = df %>%
+      group_by(horizon) %>%
+      slice_head(prop = 0.3) %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_predictions" = "AR",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "med_weights_predictions" = "MF",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon)%>%
+      filter(actual != 0) %>%
+      summarise(mape = 100*mean(abs(actual - pred) / actual,na.rm=T),.groups="drop")
+    return(df_long)
+  }
+}
+
+mae_df_generator_analysis2 = function(df, with_structural_break){
+  if (with_structural_break == T){
+    df_long = df %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(pred = ifelse(pred<0,0,pred)) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_predictions" = "AR",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "med_weights_predictions" = "MF",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon) %>%
+      summarise(mae = mean(abs(actual-pred)),.groups="drop")
+    return(df_long)
+    
+  } else {
+    df_long= df %>%
+      group_by(horizon) %>%
+      slice_head(prop = 0.3) %>%
+      ungroup() %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(pred = ifelse(pred<0,0,pred)) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_predictions" = "AR",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "med_weights_predictions" = "MF",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon) %>%
+      summarise(mae = mean(abs(actual-pred)),.groups="drop")
+    return(df_long)
+  }
+}
+
+mase_df_generator_analysis2 = function(df, naive_mean_df, structural_break){
+  if (structural_break == T){
+    df_long = df %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_predictions" = "AR",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "med_weights_predictions" = "MF",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon) %>%
+      left_join(naive_mean_df, by="horizon") %>%
+      summarise(mase = mean(abs(actual-pred))/naive_mean,.groups="drop") %>%
+      unique()
+    return(df_long)
+  } else {
+    df_long= df %>%
+      group_by(horizon) %>%
+      slice_head(prop = 0.3) %>%
+      ungroup() %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_predictions" = "AR",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "med_weights_predictions" = "MF",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon) %>%
+      left_join(naive_mean_df, by="horizon") %>%
+      summarise(mase = mean(abs(actual-pred))/naive_mean,.groups="drop") %>%
+      unique()
+    return(df_long)
+  }
+}
+```
+
+# Data: Supplementary Information S1 Data Tables
+
+## PART 1: MAE CSV Generator
+
+The code chunk below shows the functions involved in the generation of the data tables in S1
+```{r}
+mae_csv_generator = function(df, with_structural_break){
+  err_metrics = mae_df_generator(df, with_structural_break) %>% 
+      pivot_wider(
+        names_from = model,   
+        values_from = mae) %>% 
+      mutate(across(where(is.numeric), ~ round(., 2)))
+  if (with_structural_break == T){
+    
+    mean_values = df %>% 
+      group_by(horizon) %>% 
+      summarise(mean_case = signif(mean(actual),3),.groups="drop")
+    final_df = err_metrics %>%
+      inner_join(mean_values, by = "horizon")
+  } else {
+    mean_values = df %>% 
+      group_by(horizon) %>% 
+      slice_head(prop = 0.3) %>%
+      summarise(mean_case = signif(mean(actual),3),.groups="drop")
+    final_df = err_metrics %>%
+      inner_join(mean_values, by = "horizon")
+  }
+  final_df = final_df %>% 
+    dplyr::select(horizon,	Naive,	`AR (A)`,	`AR (B)`,	`AR (C)`,	`AR (D)`,	`GAM-XGBoost`,	`GAMLSS`,	`GLM-GAMSEL`, MLP,	BG1,	BG2,	SA,	MF, TM,	mean_case)
+  return(final_df)
+}
+
+mae_csv_generator_2_analysis2 = function(df, with_structural_break){
+  err_metrics = mae_df_generator_analysis2(df, with_structural_break) %>% 
+      pivot_wider(
+        names_from = model,   
+        values_from = mae) %>% 
+      mutate(across(where(is.numeric), ~ round(., 2)))
+  if (with_structural_break == T){
+    
+    mean_values = df %>% 
+      group_by(horizon) %>% 
+      summarise(mean_case = signif(mean(actual),3),.groups="drop")
+    final_df = err_metrics %>%
+      inner_join(mean_values, by = "horizon")
+  } else {
+    mean_values = df %>% 
+      group_by(horizon) %>% 
+      slice_head(prop = 0.3) %>%
+      summarise(mean_case = signif(mean(actual),3),.groups="drop")
+    final_df = err_metrics %>%
+      inner_join(mean_values, by = "horizon")
+  }
+  final_df = final_df %>% 
+    dplyr::select(horizon, AR, GAMLSS, `GAM-XGBoost`, `GLM-GAMSEL`, MLP, BG1, BG2, SA, MF, TM, mean_case)
+  return(final_df)
+}
+
+# Generation of Data Tables
+mape_csv = function(df, structural_break){
+  final = mape_df_generator(df, structural_break) %>% 
+      pivot_wider(
+        names_from = model,   
+        values_from = mape) %>% 
+      mutate(across(where(is.numeric), ~ round(., 2)))
+  final = final %>% 
+    dplyr::select(horizon,	Naive,	`AR (A)`,	`AR (B)`,	`AR (C)`,	`AR (D)`,	`GAM-XGBoost`,	`GAMLSS`,	`GLM-GAMSEL`, MLP,	BG1,	BG2,	SA,	MF, TM)
+  return(final)
+}
+
+mape_csv_analysis2 = function(df, structural_break){
+  final = mape_df_generator_analysis2(df, structural_break) %>% 
+      pivot_wider(
+        names_from = model,   
+        values_from = mape) %>% 
+      mutate(across(where(is.numeric), ~ round(., 2))) %>% 
+      dplyr::select(horizon, AR, GAMLSS, `GAM-XGBoost`, `GLM-GAMSEL`, MLP, BG1, BG2, SA, MF, TM)
+  return(final)
+}
+
+mase_csv = function(df, naive_mean_df, structural_break){
+  final = mase_df_generator(df, naive_mean_df, structural_break) %>% 
+      pivot_wider(
+        names_from = model,   
+        values_from = mase) %>% 
+      mutate(across(where(is.numeric), ~ round(., 2)))
+  final = final %>% 
+    dplyr::select(horizon,	Naive,	`AR (A)`,	`AR (B)`,	`AR (C)`,	`AR (D)`,	`GAM-XGBoost`,	`GAMLSS`,	`GLM-GAMSEL`, MLP,	BG1,	BG2,	SA,	MF, TM)
+  return(final)
+}
+
+mase_csv_analysis2 = function(df, naive_mean_df, structural_break){
+  final = mase_df_generator_analysis2(df, naive_mean_df, structural_break) %>% 
+      pivot_wider(
+        names_from = model,   
+        values_from = mase) %>% 
+      mutate(across(where(is.numeric), ~ round(., 2))) %>% 
+      dplyr::select(horizon, AR, GAMLSS, `GAM-XGBoost`, `GLM-GAMSEL`, MLP, BG1, BG2, SA, MF, TM)
+  return(final)
+}
+```
+
+Code chunk below describes the process of generation for all 3 metrics: MAE, MAPE and MASE
+
+```{r}
+##### METRIC 1: MAE #####
+for (var in asthma_variables){
+  file_name = paste0("asthma_",var,"_all_280225")
+  file = get(file_name)
+  df_struc = mae_csv_generator(file, with_structural_break = T)
+  folder_name = paste0(var,"_err")
+  if (!dir.exists(folder_name)) {
+    dir.create(folder_name)
+  }
+  save_path = file.path(getwd(), folder_name)
+  output_file_name = paste0("asthma_mae_", var, "_processed_with_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_struc, file = full_save_path, row.names = FALSE)
+  
+  df_no_struc = mae_csv_generator(file, with_structural_break = F)
+  output_file_name = paste0("asthma_mae_", var, "_processed_no_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_no_struc, file = full_save_path, row.names = FALSE)
+}
+
+for (var in copd_variables){
+  file_name = paste0("copd_",var,"_all_280225")
+  file = get(file_name)
+  df_struc = mae_csv_generator(file, with_structural_break = T)
+  folder_name = paste0(var,"_err")
+  if (!dir.exists(folder_name)) {
+    dir.create(folder_name)
+  }
+  save_path = file.path(getwd(), folder_name)
+  output_file_name = paste0("copd_mae_", var, "_processed_with_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_struc, file = full_save_path, row.names = FALSE)
+  
+  df_no_struc = mae_csv_generator(file, with_structural_break = F)
+  output_file_name = paste0("copd_mae_", var, "_processed_no_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_no_struc, file = full_save_path, row.names = FALSE)
+}
+
+for (var in asthma_variables){
+  file_name = paste0("asthma_",var,"_all_280225")
+  file = get(file_name)
+  df_struc = mae_csv_generator(file, with_structural_break = T)
+  folder_name = paste0(var,"_err")
+  if (!dir.exists(folder_name)) {
+    dir.create(folder_name)
+  }
+  save_path = file.path(getwd(), folder_name)
+  output_file_name = paste0("asthma_mae_", var, "_processed_with_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_struc, file = full_save_path, row.names = FALSE)
+  
+  df_no_struc = mae_csv_generator(file, with_structural_break = F)
+  output_file_name = paste0("asthma_mae_", var, "_processed_no_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_no_struc, file = full_save_path, row.names = FALSE)
+}
+
+# Data Tables for Analysis 2 (Exog vs Non-Exog, Aggregated vs Total)
+for (var in analysis_2_factors){
+  file_name = paste0("copd_",var,"_combined_all_090325")
+  file = get(file_name)
+  df_struc = mae_csv_generator_2_analysis2(file, with_structural_break = T)
+  folder_name = paste0(var,"_err")
+  if (!dir.exists(folder_name)) {
+    dir.create(folder_name)
+  }
+  save_path = file.path(getwd(), folder_name)
+  output_file_name = paste0("copd_mae_", var, "_processed_with_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_struc, file = full_save_path, row.names = FALSE)
+  
+  df_no_struc = mae_csv_generator_2_analysis2(file, with_structural_break = F)
+  output_file_name = paste0("copd_mae_", var, "_processed_no_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_no_struc, file = full_save_path, row.names = FALSE)
+}
+
+for (var in analysis_2_factors){
+  file_name = paste0("asthma_",var,"_combined_all_090325")
+  file = get(file_name)
+  df_struc = mae_csv_generator_2_analysis2(file, with_structural_break = T)
+  folder_name = paste0(var,"_err")
+  if (!dir.exists(folder_name)) {
+    dir.create(folder_name)
+  }
+  save_path = file.path(getwd(), folder_name)
+  output_file_name = paste0("asthma_mae_", var, "_processed_with_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_struc, file = full_save_path, row.names = FALSE)
+  
+  df_no_struc = mae_csv_generator_2_analysis2(file, with_structural_break = F)
+  output_file_name = paste0("asthma_mae_", var, "_processed_no_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_no_struc, file = full_save_path, row.names = FALSE)
+}
+
+##### METRIC 2: MAPE CSV Code #####
+for (var in asthma_variables){
+  file_name = paste0("asthma_",var,"_all_280225")
+  file = get(file_name)
+  df_struc = mape_csv(file, structural_break = T)
+  folder_name = paste0(var,"_err")
+  if (!dir.exists(folder_name)) {
+    dir.create(folder_name)
+  }
+  save_path = file.path(getwd(), folder_name)
+  output_file_name = paste0("asthma_mape_", var, "_processed_with_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_struc, file = full_save_path, row.names = FALSE)
+  
+  df_no_struc = mape_csv(file, structural_break = F)
+  output_file_name = paste0("asthma_mape_", var, "_processed_no_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_no_struc, file = full_save_path, row.names = FALSE)
+}
+
+for (var in copd_variables){
+  file_name = paste0("copd_",var,"_all_280225")
+  file = get(file_name)
+  df_struc = mape_csv(file, structural_break = T)
+  folder_name = paste0(var,"_err")
+  if (!dir.exists(folder_name)) {
+    dir.create(folder_name)
+  }
+  save_path = file.path(getwd(), folder_name)
+  output_file_name = paste0("copd_mape_", var, "_processed_with_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_struc, file = full_save_path, row.names = FALSE)
+  
+  df_no_struc = mape_csv(file, structural_break = F)
+  output_file_name = paste0("copd_mape_", var, "_processed_no_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_no_struc, file = full_save_path, row.names = FALSE)
+}
+
+# Data Tables for Analysis 2 (Exog vs Non-Exog, Aggregated vs Total)
+for (var in analysis_2_factors){
+  file_name = paste0("copd_",var,"_combined_all_090325")
+  file = get(file_name)
+  df_struc = mape_csv_analysis2(file, structural_break = T)
+  folder_name = paste0(var,"_err")
+  if (!dir.exists(folder_name)) {
+    dir.create(folder_name)
+  }
+  save_path = file.path(getwd(), folder_name)
+  output_file_name = paste0("copd_mape_", var, "_processed_with_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_struc, file = full_save_path, row.names = FALSE)
+  
+  df_no_struc = mape_csv_analysis2(file, structural_break = F)
+  output_file_name = paste0("copd_mape_", var, "_processed_no_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_no_struc, file = full_save_path, row.names = FALSE)
+}
+
+for (var in analysis_2_factors){
+  file_name = paste0("asthma_",var,"_combined_all_090325")
+  file = get(file_name)
+  df_struc = mape_csv_analysis2(file, structural_break = T)
+  folder_name = paste0(var,"_err")
+  if (!dir.exists(folder_name)) {
+    dir.create(folder_name)
+  }
+  save_path = file.path(getwd(), folder_name)
+  output_file_name = paste0("asthma_mape_", var, "_processed_with_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_struc, file = full_save_path, row.names = FALSE)
+  
+  df_no_struc = mape_csv_analysis2(file, structural_break = F)
+  output_file_name = paste0("asthma_mape_", var, "_processed_no_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_no_struc, file = full_save_path, row.names = FALSE)
+}
+
+##### METRIC 3: MASE #####
+for (var in copd_variables){
+  file_name = paste0("copd_",var,"_all_280225")
+  if (var == "discharge"){
+    var_name = "cases"
+  } else {
+    var_name = var
+  }
+  outcome = paste0(var_name, "_copd")
+  naive_mean_df = naive_mean_generator(outcome_var = outcome)
+  file = get(file_name)
+  df_struc = mase_csv(file, naive_mean_df, structural_break = T)
+  folder_name = paste0(var,"_err")
+  if (!dir.exists(folder_name)) {
+    dir.create(folder_name)
+  }
+  save_path = file.path(getwd(), folder_name)
+  output_file_name = paste0("copd_mase_", var, "_processed_with_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_struc, file = full_save_path, row.names = FALSE)
+  
+  df_no_struc = mase_csv(file, naive_mean_df, structural_break = F)
+  output_file_name = paste0("copd_mase_", var, "_processed_no_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_no_struc, file = full_save_path, row.names = FALSE)
+}
+
+for (var in asthma_variables){
+  file_name = paste0("asthma_",var,"_all_280225")
+  if (var == "discharge"){
+    var_name = "cases"
+  } else {
+    var_name = var
+  }
+  outcome = paste0(var_name, "_asthma")
+  naive_mean_df = naive_mean_generator(outcome_var = outcome)
+  file = get(file_name)
+  df_struc = mase_csv(file, naive_mean_df, structural_break = T)
+  folder_name = paste0(var,"_err")
+  if (!dir.exists(folder_name)) {
+    dir.create(folder_name)
+  }
+  save_path = file.path(getwd(), folder_name)
+  output_file_name = paste0("asthma_mase_", var, "_processed_with_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_struc, file = full_save_path, row.names = FALSE)
+  
+  df_no_struc = mase_csv(file, naive_mean_df, structural_break = F)
+  output_file_name = paste0("asthma_mase_", var, "_processed_no_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_no_struc, file = full_save_path, row.names = FALSE)
+}
+
+# Data Tables for Analysis 2 (Exog vs Non-Exog, Aggregated vs Total)
+for (var in analysis_2_factors){
+  file_name = paste0("copd_",var,"_combined_all_090325")
+  naive_mean_df = naive_mean_generator(outcome_var = "overall_rate_copd")
+  file = get(file_name)
+  df_struc = mase_csv_analysis2(file, naive_mean_df, structural_break = T)
+  folder_name = paste0(var,"_err")
+  if (!dir.exists(folder_name)) {
+    dir.create(folder_name)
+  }
+  save_path = file.path(getwd(), folder_name)
+  output_file_name = paste0("copd_mase_", var, "_processed_with_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_struc, file = full_save_path, row.names = FALSE)
+  
+  df_no_struc = mase_csv_analysis2(file, naive_mean_df, structural_break = F)
+  output_file_name = paste0("copd_mase_", var, "_processed_no_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_no_struc, file = full_save_path, row.names = FALSE)
+}
+
+
+for (var in analysis_2_factors){
+  file_name = paste0("asthma_",var,"_combined_all_090325")
+  naive_mean_df = naive_mean_generator(outcome_var = "overall_rate_asthma")
+  file = get(file_name)
+  df_struc = mase_csv_analysis2(file, naive_mean_df, structural_break = T)
+  folder_name = paste0(var,"_err")
+  if (!dir.exists(folder_name)) {
+    dir.create(folder_name)
+  }
+  save_path = file.path(getwd(), folder_name)
+  output_file_name = paste0("asthma_mase_", var, "_processed_with_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_struc, file = full_save_path, row.names = FALSE)
+  
+  df_no_struc = mase_csv_analysis2(file, naive_mean_df, structural_break = F)
+  output_file_name = paste0("asthma_mase_", var, "_processed_no_structuralbreak.csv")
+  full_save_path = file.path(save_path, output_file_name)
+  write.csv(df_no_struc, file = full_save_path, row.names = FALSE)
+}
+```

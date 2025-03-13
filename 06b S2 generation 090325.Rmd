@@ -1,0 +1,370 @@
+---
+title: "05a plotting"
+output: 
+  pdf_document:
+    dev: cairo_pdf
+date: "2024-12-15"
+---
+
+# Loading the relevant packages
+```{r setup, include=FALSE}
+rm(list=ls())
+library(ggplot2)
+library(tidyverse)
+library(gridExtra)
+library(lubridate)
+library(cowplot)
+
+asthma_variables = c("cases","female", "male", "age_15_to_39", "age_40_to_54", "age_55_to_64", "age_65_to_74", "age_75_to_84", "age_85_above")
+copd_variables = c("cases", "female", "male", "age_55_to_64", "age_65_to_74", "age_75_to_84", "age_85_above")
+
+for (var in copd_variables){
+  file_name = paste0("copd_",var,"_all_280225.rdata")
+  load(file_name)
+}
+
+for (var in asthma_variables){
+  file_name = paste0("asthma_",var,"_all_280225.rdata")
+  load(file_name)
+}
+```
+
+# Description of File
+
+In this coding file, the code to generate each table in Supplementary Information S2 will be shown. This file is specific to the generation of the graphs comparing the forecasting performances of the different models based on Wald's Test.
+
+# MAPE Statistics
+
+```{r}
+mape_df_generator = function(df, structural_break){
+  if (structural_break == T){
+    df_long = df %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_env_predictions" = "AR (C)",
+                            "ar_mixed_predictions" = "AR (D)",
+                            "ar_other_disease_predictions" = "AR (B)",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "med_weights_predictions" = "MF",
+                            "naive_predictions" = "Naive",
+                            "pure_ar_predictions" = "AR (A)",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon)%>%
+      filter(actual != 0) %>%
+      summarise(mape = 100*mean(abs(actual - pred) / actual,na.rm=T),.groups="drop")
+    return(df_long)
+  } else {
+    df_long = df %>%
+      group_by(horizon) %>%
+      slice_head(prop = 0.3) %>%
+      dplyr::select(actual, horizon, ends_with("_predictions")) %>%
+      pivot_longer(
+        cols = -c(actual, horizon), 
+        names_to = "model", 
+        values_to = "pred"
+      ) %>%
+      mutate(model = recode(model,
+                            "aml_predictions" = "MLP",
+                            "ar_env_predictions" = "AR (C)",
+                            "ar_mixed_predictions" = "AR (D)",
+                            "ar_other_disease_predictions" = "AR (B)",
+                            "bg1_predictions" = "BG1",
+                            "bg2_predictions" = "BG2",
+                            "eq_weights_predictions" = "SA",
+                            "gam_lss_predictions" = "GAMLSS",
+                            "gam_xgboost_predictions" = "GAM-XGBoost",
+                            "glm_gamsel_predictions" = "GLM-GAMSEL",
+                            "med_weights_predictions" = "MF",
+                            "naive_predictions" = "Naive",
+                            "pure_ar_predictions" = "AR (A)",
+                            "trimmed_mean_predictions" = "TM"
+                            )) %>%
+      group_by(model, horizon)%>%
+      filter(actual != 0) %>%
+      summarise(mape = 100*mean(abs(actual - pred) / actual,na.rm=T),.groups="drop")
+    return(df_long)
+  }
+}
+```
+
+# Compute Wald Statistic - Comparison of Models
+- Relative performance between models to determine which model performs better
+
+```{r}
+
+# Function to calculate proportion of times each model performs better; 95% confidence level
+calculate_proportions = function(df, significance_level = 0.05,horizon_num,structural_break=T) {
+  final_df = data.frame(matrix(ncol = 3, nrow = 0))
+  colnames(final_df) = c("Model 1", "Model 2", "Outcome")
+  if (structural_break == T){
+    df_long = df %>%
+        filter(horizon == horizon_num) %>%
+        ungroup() %>%
+        dplyr::select(actual, ends_with("predictions")) %>%
+        mutate(time = row_number()) %>%
+        pivot_longer(
+          cols = -c(time,actual), 
+          names_to = "model", 
+          values_to = "pred") %>%
+        mutate(model = recode(model,
+                              "aml_predictions" = "MLP",
+                              "ar_env_predictions" = "AR (C)",
+                              "ar_mixed_predictions" = "AR (D)",
+                              "ar_other_disease_predictions" = "AR (B)",
+                              "bg1_predictions" = "BG1",
+                              "bg2_predictions" = "BG2",
+                              "eq_weights_predictions" = "SA",
+                              "gam_lss_predictions" = "GAMLSS",
+                              "gam_xgboost_predictions" = "GAM-XGBoost","glm_gamsel_predictions" = "GLM-GAMSEL",
+                              "historical_predictions" = "Historical Mean",
+                              "med_weights_predictions" = "MF",
+                              "naive_predictions" = "Naive",
+                              "pure_ar_predictions" = "AR (A)",
+                              "trimmed_mean_predictions" = "TM"
+                              )) %>%
+        mutate(pred = ifelse(pred<0,0,pred),
+               err = abs(pred-actual))
+  } else {
+    df_long = df %>%
+        filter(horizon == horizon_num) %>%
+        ungroup() %>%
+        slice_head(prop = 0.3) %>%
+        dplyr::select(actual, ends_with("predictions")) %>%
+        mutate(time = row_number()) %>%
+        pivot_longer(
+          cols = -c(time,actual), 
+          names_to = "model", 
+          values_to = "pred") %>%
+        mutate(model = recode(model,
+                              "aml_predictions" = "MLP",
+                              "ar_env_predictions" = "AR (C)",
+                              "ar_mixed_predictions" = "AR (D)",
+                              "ar_other_disease_predictions" = "AR (B)",
+                              "bg1_predictions" = "BG1",
+                              "bg2_predictions" = "BG2",
+                              "eq_weights_predictions" = "SA",
+                              "gam_lss_predictions" = "GAMLSS",
+                              "gam_xgboost_predictions" = "GAM-XGBoost","glm_gamsel_predictions" = "GLM-GAMSEL",
+                              "historical_predictions" = "Historical Mean",
+                              "med_weights_predictions" = "MF",
+                              "naive_predictions" = "Naive",
+                              "pure_ar_predictions" = "AR (A)",
+                              "trimmed_mean_predictions" = "TM"
+                              )) %>%
+        mutate(pred = ifelse(pred<0,0,pred),
+               err = abs(pred-actual))
+  }
+  
+  model_names = unique(df_long$model)
+  model_names_sorted = sort(model_names)
+  pairs_matrix = combn(model_names_sorted, 2, simplify = TRUE)
+  
+  # Initialize a vector to store counts of how many times each model performs better
+  better_count = setNames(rep(0, length(model_names_sorted)), model_names_sorted)
+  total_comparisons = setNames(rep(0, length(model_names_sorted)), model_names_sorted)
+  # return(better_count)
+  # Loop over all pairs and compute Wald statistic
+  for (i in 1:ncol(pairs_matrix)) {
+    model1 = pairs_matrix[1, i]
+    # return(model1)
+    model2 = pairs_matrix[2, i]
+    # return(model2)
+    
+    compute_wald_one_sided = function(errors1, errors2) {
+      mean_diff = mean(errors1 - errors2)
+      var_diff = var(errors1 - errors2) / length(errors1)
+      wald_stat = (mean_diff^2) / var_diff
+      return(as.numeric(wald_stat))
+    }
+
+    model1_err = df_long %>% 
+      filter(model == model1) %>%
+      pull(err)
+    
+    model2_err = df_long %>%
+      filter(model == model2) %>%
+      pull(err)
+    # Compute Wald statistic
+    wald_stat = compute_wald_one_sided(model1_err,model2_err)
+    # Chi-squared critical value (df = 1 for one-sided comparison)
+    critical_value = qchisq(1 - significance_level, df = 1)
+
+    if (wald_stat > critical_value) { # Means there is statistically significant difference in forecast accuracy
+      if (mean(model1_err) < mean(model2_err)){
+        better_count[model1] = better_count[model1] + 1
+        outcome = "Model 1"
+        print(paste(model1, "is better than",model2))
+      } else {
+        better_count[model2] = better_count[model2] + 1
+        outcome = "Model 2"
+        print(paste(model1,  "is worse than",model2))
+      }
+    } else {
+      better_count[model2] = better_count[model2] + 1
+      outcome = "Equivalent"
+      print(paste("Both", model1, "and", model2, "are equivalent"))
+    }
+    new_row = data.frame(`Model 1` = model1, 
+                      `Model 2` = model2, 
+                      Outcome = outcome)
+    final_df = rbind(final_df, new_row)
+    # Count the total number of comparisons for each model
+    total_comparisons[model1] = total_comparisons[model1] + 1
+    total_comparisons[model2] = total_comparisons[model2] + 1
+  }
+  
+  # Calculate the proportion of times each model performs better
+  proportion_better = better_count / total_comparisons
+  return(final_df)
+}
+
+```
+
+The chunk below describes the process of generation of the performance comparison plots across ALL 1 to 12-weeks ahead forecasts
+```{r}
+
+relative_perf_plotter = function(df, horizon_num, structural_break = T, si = T){
+  if (structural_break == T){
+    struc_bin = "With Structural Break"
+  } else {
+    struc_bin = "Without Structural Break"
+  }
+  proportions_df = calculate_proportions(df,horizon_num = horizon_num, structural_break = structural_break)
+  proportions_df$Model.1 = factor(proportions_df$Model.1, levels = unique(proportions_df$Model.1))
+  proportions_df$Model.2 = factor(proportions_df$Model.2, levels = rev(unique(proportions_df$Model.2)))
+  if (si == T){
+    shape_size = 48
+    text_size = 75
+  } else {
+    shape_size = 37
+    text_size = 72
+  }
+  final_plot = ggplot() +
+    geom_point(data = proportions_df, aes(x = Model.1, y = Model.2, color = Outcome, fill = Outcome, alpha = Outcome), shape = 22, size = shape_size) +
+    theme_minimal() +
+    scale_alpha_manual(values = c(0.2, 0.7, 0.7), 
+                       labels = c("Equivalent", "Model 1", "Model 2")) +
+    labs(title = paste("Comparison of Models", struc_bin),
+         x = "Model 1",
+         y = "Model 2",
+         color = "Better Performing Model",
+         fill = "Better Performing Model",
+         alpha = "Better Performing Model") +
+    theme(plot.title = element_text(hjust = 0.5, size = text_size),
+          panel.grid = element_blank(),
+          legend.position = c(1.1, 0.9), # Top-right position
+          legend.justification = c("right", "top"),
+          # legend.box.background = element_rect(color = "black", size = 0.5),
+          axis.title.y = element_text(face = "bold",size=text_size),
+          axis.title.x = element_text(face="bold",size=text_size-5),
+          legend.title = element_text(face = "bold", size = text_size),
+          legend.text = element_text(size=text_size),
+          strip.text = element_text(size = text_size),
+          axis.text = element_text(size = text_size),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = text_size-3),
+          legend.key.size = unit(2, "lines"),
+          aspect.ratio = 2/2
+          )
+  return(final_plot)
+}
+
+letters_si = c("A","B","C","D","E","F","G","H","I","J","K","L")
+letters_main_text = c("A","B","C","B","E","F","G","C","I","J","K","D")
+
+legend_extractor = function(df, horizons, structural_break = T, si = T) {
+  if (si == T){
+    legend_size = 90
+  } else {
+    legend_size = 95
+  }
+  # Extract the legend from the first plot
+  legend = get_legend(
+    relative_perf_plotter(df, horizon_num = horizons[1], structural_break = structural_break) +
+      theme(legend.position = "right",
+            legend.justification = c(0.3, 0.5),  # Adjust to keep it centered vertically
+            # legend.box.margin = margin(0, 0, 0, 0),
+            legend.title = element_text(size = legend_size, face = "bold"),  # Adjust font size for legend title
+            legend.text = element_text(size = legend_size),
+            legend.box.background = element_rect(color = "black", size = 2),
+            legend.direction = "horizontal") # Ensure the legend is positioned correctly
+  )
+  
+  return(legend)
+}
+
+horizons_si = 1:12
+
+plot_all_horizons_without_legend_new = function(df, horizons, structural_break = T) {
+  plots = lapply(horizons, function(h) {
+    p = relative_perf_plotter(df, horizon_num = h, structural_break = structural_break) +
+      labs(title = paste0(letters_si[h],": ", h,"-week(s) ahead")) +
+      theme(plot.title = element_text(face = "bold", size = 80),
+            legend.position = "none",
+            axis.text.y = if (h %in% c(1, 4, 7, 10)) element_text() else element_blank(),
+            axis.title.y = if (h %in% c(1, 4, 7, 10)) element_text() else element_blank(),
+            axis.text.x = if (h %in% c(10, 11, 12)) element_text() else element_blank(),
+            axis.title.x = if (h %in% c(10, 11, 12)) element_text() else element_blank(),
+            plot.margin = margin(50,0,0,0))
+    return(p)
+  })
+  final_plot = plot_grid(plotlist = plots, ncol = 3, nrow = 4, rel_widths = c(1.5,1,1), rel_heights = c(1,1,1,1.3))
+  return(final_plot)
+}
+
+for (var in copd_variables){
+  df = get(paste0("copd_", var, "_all_280225"))
+  with_struc_break = plot_all_horizons_without_legend_new(df, horizons_si, structural_break = T)
+  without_struc_break = plot_all_horizons_without_legend_new(df, horizons_si, structural_break = F)
+  legend = legend_extractor(df, horizons_si, structural_break = F)
+  
+  file_name = paste0("copd_modelcomp_", var)
+  overall_struc_break = plot_grid(with_struc_break,
+    legend, nrow = 2,
+    rel_heights = c(20,1)
+  )
+  
+  overall_no_struc_break = plot_grid(without_struc_break,
+    legend, nrow = 2,
+    rel_heights = c(20,1)
+  )
+  
+  file_name = paste0("copd_", var, "_modelcomp_")
+  ggsave(file=paste0(file_name, "with_strucbreak_100325.pdf"), plot=overall_struc_break, width=65, height=90, limitsize=FALSE)
+  ggsave(file=paste0(file_name, "no_strucbreak_100325.pdf"), plot=overall_no_struc_break, width=65, height=90, limitsize=FALSE)
+}
+
+for (var in asthma_variables){
+  df = get(paste0("asthma_", var, "_all_280225"))
+  with_struc_break = plot_all_horizons_without_legend_new(df, horizons_si, structural_break = T)
+  without_struc_break = plot_all_horizons_without_legend_new(df, horizons_si, structural_break = F)
+  legend = legend_extractor(df, horizons_si, structural_break = F)
+  
+  file_name = paste0("asthma_modelcomp_", var)
+  overall_struc_break = plot_grid(with_struc_break,
+                                  legend, nrow = 2,
+                                  rel_heights = c(20,1)
+  )
+  
+  overall_no_struc_break = plot_grid(without_struc_break,
+                                     legend, nrow = 2,
+                                     rel_heights = c(20,1)
+  )
+  
+  file_name = paste0("asthma_", var, "_modelcomp_")
+  ggsave(file=paste0(file_name, "with_strucbreak_100325.pdf"), plot=overall_struc_break, width=65, height=90, limitsize=FALSE)
+  ggsave(file=paste0(file_name, "no_strucbreak_100325.pdf"), plot=overall_no_struc_break, width=65, height=90, limitsize=FALSE)
+}
+```
+
