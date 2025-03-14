@@ -14,9 +14,6 @@ The following steps were performed:
 
 (2) Main Function for models
 - AR (Pure) --> only lagged outcome variables as covariates
-- AR (Other Disease) --> only lagged outcome and lagged (other) disease variables as covariates
-- AR (Env) --> only lagged outcome and lagged environmental variables as covariates
-- AR (Mixed) --> lagged outcome, lagged (other) disease, and lagged environmental variables as covariates
 - GAMLSS
 - GLM-GAMSEL
 - GAM-XGBoost
