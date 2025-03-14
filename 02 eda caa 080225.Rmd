@@ -1,0 +1,383 @@
+---
+title: "Data Exploration"
+output: html_document
+date: "2024-09-16"
+---
+
+In this EDA file, the following actions were performed:
+
+(1) Generation of Summary Statistics for the variables in the dataset.
+
+(2) Generation of PACF and Time Series plots for each disease is done to obtain the optimum lag, while also identifying the structural break within the dataset.
+
+(3) Determination of the need of the consideration of nonlinear relationships between covariates and outcome variables.
+
+Libraries used in this file are loaded
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+library(tidyverse)
+library(stringr)
+library(MASS)
+library(readxl)
+library(httr)
+library(jsonlite)
+library(lubridate)
+library(tidyr)
+library(ISOweek)
+library(ggplot2)
+library(viridis)
+library(tseries)
+library(cowplot)
+
+combined_df = read_csv("combined_asthma_env_080225_norates.csv")%>%
+  column_to_rownames(var = "...1")
+
+zero_proportions <- combined_df %>%
+  summarise(across(contains("admissions"), ~ mean(. == 0, na.rm = TRUE)))
+
+cols_to_remove = names(zero_proportions)[zero_proportions > 0.5] # COPD 40 to 54, asthma 0 to 14
+
+# Keep only relevant columns in the dataset
+combined_df = combined_df %>%
+  dplyr::select(-c(cols_to_remove,age_40_to_54_residents_COPD,age_40_to_54_overall_rate_COPD,age_0_to_14_residents_asthma,age_0_to_14_overall_rate_asthma))
+```
+
+# Action 1: Summary Statistics
+
+The following describes the summary statistics of the dataset:
+
+```{r}
+summary_stats = function(data) {
+  data.frame(
+    Max = round(sapply(data, max, na.rm = T), 2),
+    Mean = round(sapply(data, mean, na.rm = T), 2),
+    Min = round(sapply(data, min, na.rm = T), 2),
+    Variance = round(sapply(data, var, na.rm = T), 2)
+  )
+}
+
+summary_df = summary_stats(combined_df)
+summary_df
+```
+
+# Action 2: Generation of PACF plots
+
+Firstly, stationarity of the dataframes for COPD and Asthma is checked using the ADF test. From the results, the outcome variable is stationary using ADF.
+```{r}
+rownames_split = as.numeric(rownames(combined_df_edited))
+# Extraction of Years and Months
+years = floor(rownames_split / 100) 
+weeks = rownames_split %% 100  
+
+start_year = years[1]
+start_week = weeks[1]
+
+ts_data = ts(combined_df_edited$cases_copd, start = c(start_year, start_week), frequency = 52)
+ts_data_asthma = ts(combined_df_edited$cases_asthma, start = c(start_year, start_week), frequency = 52)
+
+adf.test(ts_data)$p.value
+adf.test(ts_data_asthma)$p.value
+```
+
+## Plotting of PACF diagram to find optimum lag for pure Autoregressive Model
+Next, using Ljung-Box test, the optimum lag (Lag = 1) is determined for each model using the initial training set (50% of the dataset size)
+```{r pressure, echo=FALSE}
+pacf_plotter = function(df, var){
+  pacf_values = acf(df[[var]], type = "partial", plot = FALSE)
+  pacf_df = data.frame(
+    Lag = as.vector(pacf_values$lag),
+    PACF = as.vector(pacf_values$acf)
+  )
+  
+  rownames_split = as.numeric(rownames(df))
+  years = floor(rownames_split / 100) 
+  weeks = rownames_split %% 100  
+  
+  start_year = years[1]
+  start_week = weeks[1]
+  
+  ts_data = ts(df[[var]], start = c(start_year, start_week), frequency = 52)
+  lag_val = 0
+  for (lag_num in 1:20){
+    lag_val = lag_val + 1
+    pstat = Box.test(residuals(arima(ts_data,order=c(lag_num,0,0))), lag = 3, type = "Ljung-Box")$p.value
+    # return(pstat)
+    if (pstat > 0.01){
+      final_pvalue = pstat
+      break
+    } else {
+      next
+    }
+  }
+  
+  pacf_df = pacf_df %>% mutate(Shades = ifelse(Lag <= lag_val, "Used Lag", "Unused Lag"))
+  
+  final_plot = ggplot(pacf_df, aes(x = Lag, y = PACF, fill = Shades)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Lags",
+         y = "Partial Autocorrelation") +
+    scale_y_continuous(limits=c(-0.1,0.5)) +
+    theme_minimal() +
+    theme(
+      axis.ticks = element_line(),  # Add axis ticks
+      axis.ticks.length = unit(1, "cm"),
+      plot.title = element_text(hjust = 0.5, size = 30),
+      legend.position = c(0.65, 1),  # Top-left corner
+      legend.justification = c(0, 1),
+      panel.grid = element_blank(),
+      # panel.background = element_rect(fill = "lightblue"),
+      legend.box.background = element_rect(color = "black", fill = "white", size = 0.5),
+      # legend.background = element_rect(fill = "white", color = NA),
+      axis.title.y = element_text(face = "bold", size = 50),
+      axis.title.x = element_text(face = "bold", size = 50),
+      panel.border = element_rect(color = "black", fill = NA, size = 1),
+      strip.text = element_text(size = 50),
+      axis.text = element_text(size = 50),
+      legend.title = element_text(face = "bold", size=50),
+      legend.text = element_text(size=50)
+    )
+  return(final_plot)
+}
+
+new_combined = combined_df_edited[1:floor(0.5*nrow(combined_df_edited)),]
+
+copd_plot = pacf_plotter(new_combined, "cases_copd") + theme(legend.position = "none")+
+  scale_y_continuous(breaks = waiver(),limits=c(-0.1,0.5)) + 
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) + 
+  labs(x = NULL)
+
+legend = get_legend(
+    pacf_plotter(new_combined, "cases_copd") +
+      theme(legend.position = "right",
+            legend.justification = c(0.3, 0.5),
+            legend.box.margin = margin(0, 0, 0, -2),
+            legend.title = element_text(size = 50, face = "bold"),
+            legend.text = element_text(size = 45))
+  )
+
+asthma_plot = pacf_plotter(new_combined, "cases_asthma")+ theme(legend.position = "none")
+
+overall = plot_grid(plot_grid(copd_plot, asthma_plot,labels = "AUTO", ncol = 1, label_size = 70,hjust = 0.05,vjust=1),
+                            legend,
+                            ncol = 2, # 2 columns: one for plots, one for the legend
+                            rel_widths = c(6, 1)) # Adjust widths (6:1 for better spacing)
+
+ggsave(file="combined_pacf_080225.pdf", plot=overall, width=30, height=22.5, limitsize=FALSE)
+```
+
+# Action 3: Determination of the need to consider nonlinear relationships
+
+The decision of smoothing of disease and environmental Factors is made based on AIC values generated from GAMs.
+
+First, variables are lagged (based on the optimum lag), and generation of a 1-month ahead forecast dataset was used.
+
+```{r}
+# colnames(combined_df_edited)
+copd_significant_predictors = c("cases_asthma", "female_overall_rate_asthma", "male_overall_rate_asthma", "MaxWind", "MeanWind", "MeanTemp", "MaxTemp", "MinTemp", "hot_week_indicator", "heat_wave_week", "Daily_Total_Rainfall","age_15_to_39_overall_rate_asthma", "age_40_to_54_overall_rate_asthma", "age_55_to_64_overall_rate_asthma", "age_65_to_74_overall_rate_asthma", "age_75_to_84_overall_rate_asthma", "age_85_above_overall_rate_asthma")
+
+asthma_significant_predictors = c("cases_copd", "female_overall_rate_copd", "male_overall_rate_copd", "age_55_to_64_overall_rate_copd", "age_65_to_74_overall_rate_copd", "age_75_to_84_overall_rate_copd","age_85_above_overall_rate_copd", "MaxWind", "MeanWind", "MeanTemp", "MaxTemp", "MinTemp", "hot_week_indicator", "heat_wave_week", "Daily_Total_Rainfall")
+
+data_editing_cases = function(df_filename, outcome, significant_predictors){
+  combined_df = read_csv(df_filename)%>%
+  column_to_rownames(var = "...1")
+  
+  if (outcome == "cases_copd"){
+    popn = "residents_copd"
+  } else if (outcome == "cases_asthma"){
+    popn = "residents_asthma"
+  } else {
+    actual_outcome = sub("_([^_]+)$", "", outcome)
+    last_part = sub(".*_(.*)$", "\\1", outcome)
+    popn = colnames(combined_df)[str_detect(colnames(combined_df), paste0(actual_outcome,"_residents","_",last_part))]
+  }
+  new_combined = combined_df %>% 
+    dplyr::select(year, week, outcome, popn, significant_predictors)
+  if (outcome == "male_asthma"|outcome=="male_copd"){
+    new_combined = new_combined %>% 
+      dplyr::select(-starts_with("female_residents"))
+  }
+  return(new_combined)
+}
+
+generate_lagged_df = function(df, copd_lag_num, asthma_lag, env_lag, outcome){
+  lagged_df = df
+  lagged_cols_df = lagged_df %>%
+      dplyr::select(outcome) 
+  
+  # Customisation of function based off the outcome (COPD / Asthma)
+  if (str_detect(outcome, "copd")){
+    disease_popn = colnames(df)[str_detect(colnames(df), "residents")]
+    other_disease = "asthma"
+    outcome_lag = copd_lag_num
+    other_disease_lag = asthma_lag
+  } else if (str_detect(outcome, "asthma")){
+    disease_popn = colnames(df)[str_detect(colnames(df), "residents")]
+    other_disease = "copd"
+    outcome_lag = asthma_lag
+    other_disease_lag = copd_lag_num
+  }
+  
+  # Loop through all columns in the dataset
+  for (col in colnames(df)){
+    if (col == "year"|col == "week"){
+      next
+    } else if (col == disease_popn){
+      lagged_col = dplyr::lag(df[[col]], 1)
+      lagged_cols_df = lagged_cols_df %>% 
+        dplyr::mutate(!!paste0(col, "_L", 1) := (lagged_col))
+      } else if (col == outcome){
+      for (i in 1:outcome_lag){
+      lagged_col = dplyr::lag(df[[col]], i)
+      lagged_cols_df = lagged_cols_df %>% 
+        dplyr::mutate(!!paste0(col, "_L", i) := (lagged_col))
+      }
+    } else if (grepl(other_disease, col)){
+      for (i in 1:other_disease_lag){
+      lagged_col = dplyr::lag(df[[col]], i)
+      lagged_cols_df = lagged_cols_df %>% 
+        dplyr::mutate(!!paste0(col, "_L", i) := (lagged_col))
+      }
+    } else {
+      for (i in 1:env_lag){
+      lagged_col = dplyr::lag(df[[col]], i)
+      lagged_cols_df = lagged_cols_df %>% 
+        dplyr::mutate(!!paste0(col, "_L", i) := lagged_col)
+      }
+    }
+  }
+  lagged_df_final = na.omit(lagged_cols_df)
+  return(lagged_df_final)
+}
+
+create_stepped_dataset = function(df, horizon, outcome) {
+  shifted_df = df
+  y = dplyr::lead(shifted_df[[outcome]], n = (horizon - 1))
+  
+  if (horizon != 1) {
+    X = shifted_df[1:(nrow(shifted_df)-(horizon-1)),] # Removing the number of rows that y was shifted up
+  } else {
+    X = shifted_df
+  }
+  X = X %>% dplyr::select(-outcome) # Removing of outcome variable
+  y = na.omit(y)
+  
+  return(list(X = X, y = y))
+}
+
+generate_gam_df = function(df_link, outcome_var, copd_lag_num = 1, asthma_lag = 1, env_lag = 1, horizon, significant_predictors, training_limit = 0.5){
+  df = data_editing_cases(df_link, outcome = outcome_var, significant_predictors = significant_predictors)
+  env_variables_to_lag = c("MaxWind", "MeanWind", "MaxTemp", "MinTemp", "MeanTemp", "hot_week_indicator", "heat_wave_week", "Daily_Total_Rainfall")
+  other_disease_var = setdiff(significant_predictors, 
+                             c(outcome_var, env_variables_to_lag))
+  training_length = floor(nrow(df)*training_limit) # Number of observations used for training the data
+  initial_theta = 5
+  disease_popn = colnames(df)[str_detect(colnames(df), "residents")]
+  lagged_disease_popn = paste0(disease_popn,"_L1")
+  training_length = floor(nrow(df)*training_limit) # Number of observations used for training the data
+  filtered_df = df %>% 
+    dplyr::select(year,week,outcome_var,disease_popn, all_of(significant_predictors))
+  regression_model = generate_lagged_df(filtered_df, copd_lag_num, asthma_lag, env_lag, outcome = outcome_var)
+  X_1 = create_stepped_dataset(regression_model, horizon, outcome = outcome_var)[[1]]
+  outcome_var_vec = create_stepped_dataset(regression_model, horizon, outcome = outcome_var)[[2]]
+  stepped_df = cbind(X_1, outcome_var_vec) # Combination to form stepped df
+  stepped_df = stepped_df %>% rename(!!outcome_var := "outcome_var_vec")
+  
+  n = nrow(stepped_df) # Length of stepped df
+  stepped_df = stepped_df %>%
+    mutate(across(everything(), ~ ifelse(is.infinite(.) & . < 0, 0, .)))
+  stepped_df = stepped_df[1:training_length, ]
+  return(stepped_df)
+}
+
+```
+
+# Step 2: Checking whether linearly related lagged variables or non-linearly related lagged variables are better
+```{r}
+other_disease_var_copd = c("female_overall_rate_asthma", "male_overall_rate_asthma", "cases_asthma", "age_15_to_39_overall_rate_asthma", "age_40_to_54_overall_rate_asthma","age_55_to_64_overall_rate_asthma","age_65_to_74_overall_rate_asthma", "age_75_to_84_overall_rate_asthma", "age_85_above_overall_rate_asthma")
+other_disease_var_asthma = c("female_overall_rate_copd", "male_overall_rate_copd", "age_55_to_64_overall_rate_copd", "age_65_to_74_overall_rate_copd", "age_75_to_84_overall_rate_copd","age_85_above_overall_rate_copd", "cases_copd")
+env_factors = c("Daily_Total_Rainfall","MaxTemp","MeanTemp","MinTemp","MeanWind","MaxWind")
+
+aic_comparator = function(df_link, outcome_var, horizon, other_disease_factors, env_factors, significant_factors, lag = 1){
+  if (str_detect(outcome_var,"copd")){
+    lagged_disease_popn = "residents_copd_L1"
+  } else if (str_detect(outcome_var,"asthma")){
+    lagged_disease_popn = "residents_asthma_L1"
+  }
+  
+  otherdis_lagged_factors_ns = paste(unlist(sapply(other_disease_factors, function(factor) {
+                              paste0(factor, "_L", 1:lag)
+                              })), collapse = " + ")
+  otherdis_lagged_factors_s = paste(unlist(sapply(other_disease_factors, function(factor) {
+                            paste0("s(",factor, "_L", 1:lag,")")
+                            })), collapse = " + ")
+  autoreg_lagged = paste(unlist(sapply(outcome_var, function(factor) {
+                                paste0(factor, "_L", 1:lag)
+                                })), collapse = " + ")
+  autoreg_lagged_s = paste(unlist(sapply(outcome_var, function(factor) {
+                                    paste0("s(",factor, "_L", 1:lag,")")
+                                  })), collapse = " + ")
+  env_lagged = paste(unlist(sapply(env_factors, function(factor) {
+                      paste0(factor, "_L", 1:1)
+                      })), collapse = " + ")
+  env_lagged_s = paste(unlist(sapply(env_factors, function(factor) {
+                        paste0("s(",factor, "_L", 1:1,")")
+                      })), collapse = " + ")
+  
+  x = generate_gam_df(df_link,outcome_var,horizon = horizon,significant_predictors = significant_factors)
+  # return(x)
+  gam_model_autoreg = bam(as.formula(paste(outcome_var, "~ offset(log(", lagged_disease_popn, ")) + ",autoreg_lagged)),
+                     family = nb(link = "log"), data = x)
+
+  gam_model_autoreg_s = bam(as.formula(paste(outcome_var, "~ offset(log(", lagged_disease_popn, ")) + ",autoreg_lagged_s)),
+                       family = nb(link = "log"), data = x)
+  
+  gam_model_otherdis = bam(as.formula(paste(outcome_var, "~ offset(log(", lagged_disease_popn, ")) + ",otherdis_lagged_factors_ns)), family = nb(link = "log"), data = x)
+  
+  gam_model_otherdis_s = bam(as.formula(paste(outcome_var, "~ offset(log(", lagged_disease_popn, ")) + ",otherdis_lagged_factors_s)),
+                       family = nb(link = "log"), data = x)
+  
+  
+  gam_model_env = bam(as.formula(paste(outcome_var, "~ offset(log(", lagged_disease_popn, ")) + ",env_lagged)),
+                       family = nb(link = "log"), data = x)
+  
+  
+  gam_model_env_s = bam(as.formula(paste(outcome_var, "~ offset(log(", lagged_disease_popn, ")) + ",env_lagged_s)),
+                       family = nb(link = "log"), data = x)
+  
+  model_names = c("gam_model_autoreg", "gam_model_autoreg_s", "gam_model_otherdis", "gam_model_otherdis_s", "gam_model_env", "gam_model_env_s")
+  combined_gam = c(AIC(gam_model_autoreg), AIC(gam_model_autoreg_s), AIC(gam_model_otherdis), AIC(gam_model_otherdis_s), AIC(gam_model_env), AIC(gam_model_env_s))
+  
+  final_df = data.frame(horizon = horizon, model_name = model_names, aic = combined_gam)
+  return(final_df)
+}
+
+copd_combined_aic_df = as.data.frame(matrix(nrow=0,ncol=3))
+colnames(copd_combined_aic_df) = c("horizon", "model_name", "aic")
+for (horizon_num in 1:12){
+  to_add = aic_comparator("combined_asthma_env_080225_norates.csv", outcome_var = "cases_copd", horizon = horizon_num, other_disease_factors = other_disease_var_copd, env_factors = env_factors, significant_factors = copd_significant_predictors)
+  copd_combined_aic_df = rbind(copd_combined_aic_df, to_add)
+}
+
+copd_aic_table = copd_combined_aic_df %>%
+  mutate(
+    Smoothed = ifelse(grepl("_s$", model_name), "Smoothed", "Non-Smoothed"),
+    model_name = gsub("_s$", "", model_name) # Remove '_s' from model names
+  ) %>%
+  pivot_wider(names_from = Smoothed, values_from = aic)
+
+asthma_combined_aic_df = as.data.frame(matrix(nrow=0,ncol=3))
+colnames(asthma_combined_aic_df) = c("horizon", "model_name", "aic")
+for (horizon_num in 1:12){
+  to_add = aic_comparator("combined_asthma_env_080225_norates.csv", outcome_var = "cases_asthma", horizon = horizon_num, other_disease_factors = other_disease_var_asthma, env_factors = env_factors, significant_factors = asthma_significant_predictors)
+  asthma_combined_aic_df = rbind(asthma_combined_aic_df, to_add)
+}
+
+asthma_aic_table = asthma_combined_aic_df %>%
+  mutate(
+    Smoothed = ifelse(grepl("_s$", model_name), "Smoothed", "Non-Smoothed"),
+    model_name = gsub("_s$", "", model_name) # Remove '_s' from model names
+  ) %>%
+  pivot_wider(names_from = Smoothed, values_from = aic)
+```
