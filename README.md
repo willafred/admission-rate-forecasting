@@ -1,4 +1,4 @@
-# Forecasting Chronic Respiratory Disease Demand Load using a Forecast Combination Framework
+# Forecasting COPD and asthma demand for clinical impact in a South-East Asian setting: A climate-informed forecast combination framework
 This file describes the various code used to generate the different models. The following describes the use of each file:
 
 | File Name | File Description |
